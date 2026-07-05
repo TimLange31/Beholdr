@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { poll } from "$lib/poll.svelte";
+  import { poll } from "$lib/poll.svelte.js";
   import type { NodeInfo } from "$lib/types";
   import { fmtMem } from "$lib/format";
   import UsageBar from "$lib/components/UsageBar.svelte";

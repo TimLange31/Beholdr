@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { poll } from "$lib/poll.svelte";
+  import { poll } from "$lib/poll.svelte.js";
   import type { Microservice } from "$lib/types";
   import { fmtCpu, fmtMem } from "$lib/format";
   import Pill from "$lib/components/Pill.svelte";

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { poll } from "$lib/poll.svelte";
+  import { poll } from "$lib/poll.svelte.js";
   import type { Cluster, Point } from "$lib/types";
   import { fmtCpu, fmtMem, fmtTime } from "$lib/format";
   import StatCard from "$lib/components/StatCard.svelte";
