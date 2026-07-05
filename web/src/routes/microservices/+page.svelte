@@ -1,7 +1,7 @@
 <script lang="ts">
   import { poll } from "$lib/poll.svelte.js";
-  import type { Microservice } from "$lib/types";
-  import { fmtCpu, fmtMem } from "$lib/format";
+  import type { Microservice } from "$lib/types.js";
+  import { fmtCpu, fmtMem } from "$lib/format.js";
   import Pill from "$lib/components/Pill.svelte";
 
   type Resp = { updated_at: number; microservices: Microservice[] };

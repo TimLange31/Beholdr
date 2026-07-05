@@ -1,7 +1,7 @@
 <script lang="ts">
   import { poll } from "$lib/poll.svelte.js";
-  import type { NodeInfo } from "$lib/types";
-  import { fmtMem } from "$lib/format";
+  import type { NodeInfo } from "$lib/types.js";
+  import { fmtMem } from "$lib/format.js";
   import UsageBar from "$lib/components/UsageBar.svelte";
   import Pill from "$lib/components/Pill.svelte";
 

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { poll } from "$lib/poll.svelte.js";
-  import type { Cluster, Point } from "$lib/types";
-  import { fmtCpu, fmtMem, fmtTime } from "$lib/format";
+  import type { Cluster, Point } from "$lib/types.js";
+  import { fmtCpu, fmtMem, fmtTime } from "$lib/format.js";
   import StatCard from "$lib/components/StatCard.svelte";
   import UsageBar from "$lib/components/UsageBar.svelte";
   import TimeChart from "$lib/components/TimeChart.svelte";

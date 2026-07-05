@@ -1,8 +1,8 @@
 <script lang="ts">
   import { page } from "$app/stores";
   import { poll } from "$lib/poll.svelte.js";
-  import type { NodeInfo, Point } from "$lib/types";
-  import { fmtCpu, fmtMem } from "$lib/format";
+  import type { NodeInfo, Point } from "$lib/types.js";
+  import { fmtCpu, fmtMem } from "$lib/format.js";
   import StatCard from "$lib/components/StatCard.svelte";
   import UsageBar from "$lib/components/UsageBar.svelte";
   import Pill from "$lib/components/Pill.svelte";
