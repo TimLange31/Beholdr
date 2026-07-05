@@ -8,10 +8,10 @@ terraform {
   }
 }
 
-provider "kubernetes" {
-  config_path    = var.kubeconfig
-  config_context = var.kube_context != "" ? var.kube_context : null
-}
+# NOTE: This module does not configure the kubernetes provider itself.
+# The calling (root) module must supply a configured `kubernetes` provider,
+# e.g. pointed at the target AKS cluster. See deploy/terraform/README for a
+# standalone-usage wrapper.
 
 locals {
   name   = "beholdr"

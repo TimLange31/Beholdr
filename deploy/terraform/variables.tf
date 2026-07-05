@@ -1,15 +1,3 @@
-variable "kubeconfig" {
-  description = "Path to kubeconfig used by Terraform to talk to the cluster."
-  type        = string
-  default     = "~/.kube/config"
-}
-
-variable "kube_context" {
-  description = "kubeconfig context to target (empty = current)."
-  type        = string
-  default     = ""
-}
-
 variable "namespace" {
   description = "Namespace Beholdr is deployed into."
   type        = string
