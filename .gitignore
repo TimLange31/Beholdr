@@ -17,6 +17,11 @@ eggs/
 lib/
 lib64/
 parts/
+# --- Project override ---
+# This repo's SvelteKit frontend lives in web/src/lib; the Python `lib/`
+# rule above would otherwise exclude the entire UI source from git.
+!web/src/lib/
+!web/src/lib/**
 sdist/
 var/
 wheels/
