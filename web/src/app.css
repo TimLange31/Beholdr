@@ -1,0 +1,18 @@
+@import "tailwindcss";
+
+/* Custom theme tokens (Tailwind v4 @theme) */
+@theme {
+  --color-brand-500: #6366f1;
+  --color-brand-400: #818cf8;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+/* thin scrollbars for the dashboard feel */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #334155 transparent;
+}

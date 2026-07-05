@@ -1,0 +1,12 @@
+# Local run against your current kube context (outside the cluster).
+services:
+  beholdr:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      BEHOLDR_KUBE_MODE: "kubeconfig"
+      KUBECONFIG: "/kube/config"
+      BEHOLDR_POLL_INTERVAL: "15"
+    volumes:
+      - ${HOME}/.kube:/kube:ro

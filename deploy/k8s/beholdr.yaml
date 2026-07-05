@@ -1,0 +1,111 @@
+# Plain-manifest equivalent of the Terraform module, for `kubectl apply`.
+# Replace IMAGE and the ingress host before applying.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: beholdr
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: beholdr
+  namespace: beholdr
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: beholdr
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: beholdr
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: beholdr
+subjects:
+  - kind: ServiceAccount
+    name: beholdr
+    namespace: beholdr
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beholdr
+  namespace: beholdr
+  labels: { app.kubernetes.io/name: beholdr }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: beholdr }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: beholdr }
+    spec:
+      serviceAccountName: beholdr
+      containers:
+        - name: beholdr
+          image: IMAGE  # <-- replace, e.g. registry.example.com/beholdr:0.1.0
+          ports:
+            - containerPort: 8000
+          env:
+            - { name: BEHOLDR_KUBE_MODE, value: "in-cluster" }
+            - { name: BEHOLDR_POLL_INTERVAL, value: "15" }
+            - { name: BEHOLDR_HISTORY_SIZE, value: "240" }
+            - { name: BEHOLDR_NAMESPACES, value: "" }
+          resources:
+            requests: { cpu: "50m", memory: "128Mi" }
+            limits: { cpu: "500m", memory: "512Mi" }
+          livenessProbe:
+            httpGet: { path: /api/health, port: 8000 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet: { path: /api/health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beholdr
+  namespace: beholdr
+  labels: { app.kubernetes.io/name: beholdr }
+spec:
+  selector: { app.kubernetes.io/name: beholdr }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: beholdr
+  namespace: beholdr
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: beholdr.example.com  # <-- replace
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: beholdr
+                port: { number: 80 }

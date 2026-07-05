@@ -1,0 +1,13 @@
+image        = "registry.example.com/beholdr:0.1.0"
+namespace    = "beholdr"
+ingress_host = "beholdr.example.com"
+ingress_class = "nginx"
+
+# Optional: TLS via cert-manager, basic-auth, etc.
+ingress_annotations = {
+  # "cert-manager.io/cluster-issuer" = "letsencrypt-prod"
+  # "nginx.ingress.kubernetes.io/auth-type" = "basic"
+}
+
+# Restrict to specific namespaces (empty = whole cluster)
+# watch_namespaces = ["production", "staging"]

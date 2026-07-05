@@ -216,3 +216,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- Beholdr (Go + SvelteKit) ----
+/beholdr
+/out/
+*.test
+# node / sveltekit
+web/node_modules/
+web/.svelte-kit/
+web/build/
+web/package-lock.json
+# embedded UI build output (stub index.html is kept)
+internal/webui/dist/*
+!internal/webui/dist/index.html
