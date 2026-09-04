@@ -112,6 +112,13 @@ resource "kubernetes_deployment" "beholdr" {
             name  = "BEHOLDR_KUBE_MODE"
             value = "in-cluster"
           }
+          env {
+            # No default: Beholdr exposes cluster topology, pod names, and
+            # resource usage, so cross-origin access must be opted into
+            # explicitly.
+            name  = "BEHOLDR_CORS_ORIGINS"
+            value = join(",", var.cors_origins)
+          }
 
           resources {
             requests = { cpu = "50m", memory = "128Mi" }
@@ -119,16 +126,21 @@ resource "kubernetes_deployment" "beholdr" {
           }
 
           liveness_probe {
+            # Liveness only proves the process can serve HTTP; it must not
+            # depend on collector/cluster state.
             http_get {
-              path = "/api/health"
+              path = "/live"
               port = 8000
             }
             initial_delay_seconds = 15
             period_seconds        = 20
           }
           readiness_probe {
+            # Readiness fails until the collector has completed a recent
+            # successful poll, so the Service won't route traffic here
+            # before there's real data (or once that data goes stale).
             http_get {
-              path = "/api/health"
+              path = "/ready"
               port = 8000
             }
             initial_delay_seconds = 5
@@ -162,10 +174,19 @@ resource "kubernetes_ingress_v1" "beholdr" {
     name        = local.name
     namespace   = kubernetes_namespace.beholdr.metadata[0].name
     labels      = local.labels
-    annotations = var.ingress_annotations
+    annotations = merge(var.ingress_annotations, var.auth_annotations)
   }
   spec {
     ingress_class_name = var.ingress_class
+
+    dynamic "tls" {
+      for_each = var.tls_secret_name != "" ? [1] : []
+      content {
+        hosts       = [var.ingress_host]
+        secret_name = var.tls_secret_name
+      }
+    }
+
     rule {
       host = var.ingress_host
       http {
@@ -180,6 +201,17 @@ resource "kubernetes_ingress_v1" "beholdr" {
           }
         }
       }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.tls_secret_name != "" || var.insecure_http
+      error_message = "Beholdr exposes cluster topology, pod names, and resource usage; the Ingress must use TLS. Set tls_secret_name (e.g. a cert-manager-issued secret) or explicitly set insecure_http = true to override for a non-production environment."
+    }
+    precondition {
+      condition     = length(var.auth_annotations) > 0 || var.insecure_no_auth
+      error_message = "Beholdr has no built-in authentication. Set auth_annotations to point at an OIDC-aware auth proxy (e.g. oauth2-proxy via nginx.ingress.kubernetes.io/auth-url + auth-signin) or explicitly set insecure_no_auth = true to override for a non-production environment."
     }
   }
 }

@@ -7,5 +7,5 @@ output "service" {
 }
 
 output "url" {
-  value = var.ingress_enabled ? "http://${var.ingress_host}/" : "port-forward: kubectl -n ${var.namespace} port-forward svc/beholdr 8000:80"
+  value = var.ingress_enabled ? "${var.tls_secret_name != "" ? "https" : "http"}://${var.ingress_host}/" : "port-forward: kubectl -n ${var.namespace} port-forward svc/beholdr 8000:80"
 }

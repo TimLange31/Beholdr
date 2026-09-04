@@ -15,19 +15,22 @@ type Config struct {
 	Namespaces    []string      // restrict monitoring; empty = all
 	KubeMode      string        // "auto" | "in-cluster" | "kubeconfig"
 	Kubeconfig    string        // path when KubeMode != in-cluster
-	AllowCORS     bool          // enable permissive CORS (handy for local dev)
+	CORSOrigins   []string      // explicit CORS allowlist; empty = CORS disabled (the default)
 	RequestTimout time.Duration // per-call timeout to the API server
 }
 
 func Load() Config {
 	return Config{
-		Addr:          env("BEHOLDR_ADDR", ":8000"),
-		PollInterval:  time.Duration(envInt("BEHOLDR_POLL_INTERVAL", 15)) * time.Second,
-		HistorySize:   envInt("BEHOLDR_HISTORY_SIZE", 240),
-		Namespaces:    splitCSV(env("BEHOLDR_NAMESPACES", "")),
-		KubeMode:      env("BEHOLDR_KUBE_MODE", "auto"),
-		Kubeconfig:    env("KUBECONFIG", ""),
-		AllowCORS:     env("BEHOLDR_CORS", "true") == "true",
+		Addr:         env("BEHOLDR_ADDR", ":8000"),
+		PollInterval: time.Duration(envInt("BEHOLDR_POLL_INTERVAL", 15)) * time.Second,
+		HistorySize:  envInt("BEHOLDR_HISTORY_SIZE", 240),
+		Namespaces:   splitCSV(env("BEHOLDR_NAMESPACES", "")),
+		KubeMode:     env("BEHOLDR_KUBE_MODE", "auto"),
+		Kubeconfig:   env("KUBECONFIG", ""),
+		// No default origins: Beholdr exposes cluster topology, pod names,
+		// and resource usage, so cross-origin access must be opted into
+		// explicitly. Set to "*" only for local development.
+		CORSOrigins:   splitCSV(env("BEHOLDR_CORS_ORIGINS", "")),
 		RequestTimout: time.Duration(envInt("BEHOLDR_REQUEST_TIMEOUT", 10)) * time.Second,
 	}
 }

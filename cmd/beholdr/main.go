@@ -41,7 +41,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.NewServer(col, cfg.AllowCORS, log).Handler(),
+		Handler:           api.NewServer(col, cfg.CORSOrigins, log).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 

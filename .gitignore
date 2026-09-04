@@ -230,7 +230,16 @@ __marimo__/
 web/node_modules/
 web/.svelte-kit/
 web/build/
-web/package-lock.json
-# embedded UI build output (stub index.html is kept)
+# terraform
+deploy/terraform/.terraform/
+deploy/terraform/terraform.tfvars
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/crash.log
+# embedded UI build output (stub index.html is kept). The generic "dist/"
+# rule above (from the Python boilerplate) ignores this whole directory
+# before git ever reaches these rules, so the directory itself must be
+# un-ignored too, or the file-level negation below is silently a no-op.
+!internal/webui/dist/
 internal/webui/dist/*
 !internal/webui/dist/index.html

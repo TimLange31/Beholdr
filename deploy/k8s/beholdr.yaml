@@ -67,15 +67,25 @@ spec:
             - { name: BEHOLDR_POLL_INTERVAL, value: "15" }
             - { name: BEHOLDR_HISTORY_SIZE, value: "240" }
             - { name: BEHOLDR_NAMESPACES, value: "" }
+            # No default: Beholdr exposes cluster topology, pod names, and
+            # resource usage, so cross-origin access must be opted into
+            # explicitly. Leave unset unless a separately-hosted frontend
+            # needs to call this API cross-origin.
+            - { name: BEHOLDR_CORS_ORIGINS, value: "" }
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
             limits: { cpu: "500m", memory: "512Mi" }
           livenessProbe:
-            httpGet: { path: /api/health, port: 8000 }
+            # Liveness only proves the process can serve HTTP; it must not
+            # depend on collector/cluster state.
+            httpGet: { path: /live, port: 8000 }
             initialDelaySeconds: 15
             periodSeconds: 20
           readinessProbe:
-            httpGet: { path: /api/health, port: 8000 }
+            # Readiness fails until the collector has completed a recent
+            # successful poll, so the Service won't route traffic here
+            # before there's real data (or once that data goes stale).
+            httpGet: { path: /ready, port: 8000 }
             initialDelaySeconds: 5
             periodSeconds: 10
 ---
@@ -97,8 +107,24 @@ kind: Ingress
 metadata:
   name: beholdr
   namespace: beholdr
+  annotations:
+    # TLS: request a certificate from cert-manager (or point tls.secretName
+    # below at a secret you manage yourself). Do not serve this over plain
+    # HTTP in production — it exposes cluster topology, pod names, and
+    # resource usage.
+    cert-manager.io/cluster-issuer: letsencrypt-prod  # <-- replace or remove if managing certs another way
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    # Authentication: Beholdr has no built-in login, so an OIDC-aware proxy
+    # must sit in front of it. Example using oauth2-proxy as an
+    # auth_request subrequest (https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/#auth):
+    nginx.ingress.kubernetes.io/auth-url: "https://oauth2-proxy.example.com/oauth2/auth"  # <-- replace with your OIDC proxy
+    nginx.ingress.kubernetes.io/auth-signin: "https://oauth2-proxy.example.com/oauth2/start?rd=$scheme://$host$request_uri"
 spec:
   ingressClassName: nginx
+  tls:
+    - hosts: [beholdr.example.com]  # <-- replace, must match the host below
+      secretName: beholdr-tls       # <-- cert-manager creates this, or supply your own
   rules:
     - host: beholdr.example.com  # <-- replace
       http:

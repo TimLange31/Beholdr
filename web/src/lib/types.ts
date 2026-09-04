@@ -26,3 +26,12 @@ export interface Microservice {
   cpu_request: number; mem_request: number; cpu_util_pct: number | null; hpa: Hpa | null;
 }
 export type Point = Record<string, number>;
+
+export interface Health {
+  ok: boolean;
+  ready: boolean;
+  last_success: number;
+  last_error: string;
+  last_error_at: number;
+  metrics_available: boolean;
+}

@@ -13,17 +13,32 @@ import (
 )
 
 type Server struct {
-	col      *collect.Collector
-	log      *slog.Logger
-	cors     bool
+	col         *collect.Collector
+	log         *slog.Logger
+	corsOrigins []string
 }
 
-func NewServer(col *collect.Collector, cors bool, log *slog.Logger) *Server {
-	return &Server{col: col, log: log, cors: cors}
+// NewServer builds the API server. corsOrigins is an explicit allowlist of
+// origins permitted to make cross-origin requests; nil/empty disables CORS
+// entirely (the default). "*" may be included to allow any origin, which is
+// only appropriate for local development.
+func NewServer(col *collect.Collector, corsOrigins []string, log *slog.Logger) *Server {
+	return &Server{col: col, log: log, corsOrigins: corsOrigins}
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	// Liveness: the process can accept and handle HTTP requests. Must not
+	// depend on collector state, or a cluster/API-server outage would cause
+	// Kubernetes to kill and restart a perfectly healthy process.
+	mux.HandleFunc("GET /live", s.live)
+	// Readiness: there has been a successful collection recently. Kubernetes
+	// should stop sending traffic here (and the LB should drop the pod) once
+	// the cached data goes stale, rather than silently serving old state.
+	mux.HandleFunc("GET /ready", s.ready)
+	// Rich status for the UI: always 200 so the frontend can poll it and
+	// render last-success/last-error without treating "not ready yet" as a
+	// network failure.
 	mux.HandleFunc("GET /api/health", s.health)
 	mux.HandleFunc("GET /api/cluster", s.cluster)
 	mux.HandleFunc("GET /api/nodes", s.nodes)
@@ -37,26 +52,61 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.cors {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
+		if origin := r.Header.Get("Origin"); origin != "" && s.corsAllowed(origin) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-			if r.Method == http.MethodOptions {
-				w.WriteHeader(http.StatusNoContent)
-				return
-			}
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
 
-// --- API handlers -----------------------------------------------------------
+func (s *Server) corsAllowed(origin string) bool {
+	for _, o := range s.corsOrigins {
+		if o == "*" || o == origin {
+			return true
+		}
+	}
+	return false
+}
 
+// --- health / readiness ------------------------------------------------------
+
+func (s *Server) live(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
+	hs := s.col.Health()
+	status := http.StatusOK
+	if !hs.Ready {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, hs)
+}
+
+// health is a rich, always-200 status view for the UI: it reports the same
+// readiness signal as /ready plus metrics availability, without the 503 that
+// would make a naive fetch() throw.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "ready": s.col.Snapshot().Ready})
+	hs := s.col.Health()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":                true,
+		"ready":             hs.Ready,
+		"last_success":      hs.LastSuccess,
+		"last_error":        hs.LastError,
+		"last_error_at":     hs.LastErrorAt,
+		"metrics_available": s.col.Snapshot().MetricsAvailable,
+	})
 }
 
 func (s *Server) cluster(w http.ResponseWriter, r *http.Request) {
-	snap, ok := s.ready(w)
+	snap, ok := s.requireData(w)
 	if !ok {
 		return
 	}
@@ -69,7 +119,7 @@ func (s *Server) cluster(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) nodes(w http.ResponseWriter, r *http.Request) {
-	snap, ok := s.ready(w)
+	snap, ok := s.requireData(w)
 	if !ok {
 		return
 	}
@@ -83,7 +133,7 @@ func (s *Server) nodes(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) nodeDetail(w http.ResponseWriter, r *http.Request) {
-	snap, ok := s.ready(w)
+	snap, ok := s.requireData(w)
 	if !ok {
 		return
 	}
@@ -100,7 +150,7 @@ func (s *Server) nodeDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) microservices(w http.ResponseWriter, r *http.Request) {
-	snap, ok := s.ready(w)
+	snap, ok := s.requireData(w)
 	if !ok {
 		return
 	}
@@ -110,7 +160,7 @@ func (s *Server) microservices(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) microserviceDetail(w http.ResponseWriter, r *http.Request) {
-	snap, ok := s.ready(w)
+	snap, ok := s.requireData(w)
 	if !ok {
 		return
 	}
@@ -139,7 +189,7 @@ func (s *Server) microserviceDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pods(w http.ResponseWriter, r *http.Request) {
-	snap, ok := s.ready(w)
+	snap, ok := s.requireData(w)
 	if !ok {
 		return
 	}
@@ -175,7 +225,10 @@ func (s *Server) spa() http.Handler {
 
 // --- helpers ----------------------------------------------------------------
 
-func (s *Server) ready(w http.ResponseWriter) (collect.Snapshot, bool) {
+// requireData gates the data endpoints on "has a collection ever succeeded",
+// so the API can keep serving the last known-good snapshot even while /ready
+// reports the data is going stale. Deliberately more lenient than /ready.
+func (s *Server) requireData(w http.ResponseWriter) (collect.Snapshot, bool) {
 	snap := s.col.Snapshot()
 	if !snap.Ready {
 		http.Error(w, "collector warming up", http.StatusServiceUnavailable)

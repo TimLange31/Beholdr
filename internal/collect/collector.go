@@ -34,25 +34,69 @@ type Collector struct {
 	src      Source
 	interval time.Duration
 	timeout  time.Duration
-	log      *slog.Logger
+	// staleAfter bounds how old the last successful collection may be before
+	// Health().Ready reports false — readiness must fail on stale data, not
+	// just on a collection that has never succeeded.
+	staleAfter time.Duration
+	log        *slog.Logger
 
 	History *History
 
 	mu   sync.RWMutex
 	snap Snapshot
 
+	lastSuccess time.Time
+	lastErr     error
+	lastErrAt   time.Time
+
 	metricsAvailable func() bool
 }
 
 func New(src Source, interval, timeout time.Duration, historySize int, metricsAvailable func() bool, log *slog.Logger) *Collector {
+	staleAfter := interval * 3
+	if staleAfter < 30*time.Second {
+		staleAfter = 30 * time.Second
+	}
 	return &Collector{
 		src:              src,
 		interval:         interval,
 		timeout:          timeout,
+		staleAfter:       staleAfter,
 		log:              log,
 		History:          NewHistory(historySize),
 		metricsAvailable: metricsAvailable,
 	}
+}
+
+// HealthStatus reports the collector's own liveness/readiness signal,
+// independent of whatever data happens to be cached in Snapshot: it reflects
+// whether the *most recent* poll succeeded recently, not merely whether one
+// has ever succeeded. Timestamps are unix seconds, 0 meaning "never".
+type HealthStatus struct {
+	Ready       bool    `json:"ready"`
+	LastSuccess float64 `json:"last_success"`
+	LastError   string  `json:"last_error,omitempty"`
+	LastErrorAt float64 `json:"last_error_at,omitempty"`
+}
+
+// Health reports whether the collector has completed a collection recently
+// enough to be trusted, plus the most recent error (if any) for diagnostics.
+func (c *Collector) Health() HealthStatus {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	hs := HealthStatus{LastSuccess: unixSeconds(c.lastSuccess), LastErrorAt: unixSeconds(c.lastErrAt)}
+	if c.lastErr != nil {
+		hs.LastError = c.lastErr.Error()
+	}
+	hs.Ready = !c.lastSuccess.IsZero() && time.Since(c.lastSuccess) < c.staleAfter
+	return hs
+}
+
+func unixSeconds(t time.Time) float64 {
+	if t.IsZero() {
+		return 0
+	}
+	return float64(t.UnixNano()) / 1e9
 }
 
 func (c *Collector) Snapshot() Snapshot {
@@ -83,16 +127,19 @@ func (c *Collector) collect(parent context.Context) {
 	nodes, err := c.src.Nodes(ctx)
 	if err != nil {
 		c.log.Error("list nodes", "err", err)
+		c.recordErr(err)
 		return
 	}
 	pods, err := c.src.Pods(ctx)
 	if err != nil {
 		c.log.Error("list pods", "err", err)
+		c.recordErr(err)
 		return
 	}
 	deployments, err := c.src.Deployments(ctx)
 	if err != nil {
 		c.log.Error("list deployments", "err", err)
+		c.recordErr(err)
 		return
 	}
 	hpas, _ := c.src.HPAs(ctx)
@@ -152,8 +199,17 @@ func (c *Collector) collect(parent context.Context) {
 	}
 	c.mu.Lock()
 	c.snap = snap
+	c.lastSuccess = time.Now()
+	c.lastErr = nil
 	c.mu.Unlock()
 	c.log.Info("collected", "nodes", len(nodeMap), "pods", len(podList), "microservices", len(msMap))
+}
+
+func (c *Collector) recordErr(err error) {
+	c.mu.Lock()
+	c.lastErr = err
+	c.lastErrAt = time.Now()
+	c.mu.Unlock()
 }
 
 // --- builders ---------------------------------------------------------------
