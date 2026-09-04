@@ -128,9 +128,9 @@ production-ready release; **P2** is planned follow-up.
   recording rules, remote write/read or an equivalent durable protocol,
   cardinality controls, and a query language/API. The Kubernetes metrics API
   alone cannot supply this. Fixed service range queries are now present; still
-  add Azure Managed Prometheus Workload Identity/token refresh, recording rules,
+  add managed Prometheus identity/token refresh, recording rules,
   query caching/concurrency limits, and configurable metric-schema profiles for
-  the legacy NLZIET ASP.NET metrics and future OpenTelemetry metrics.
+  ASP.NET Core runtime metrics and future OpenTelemetry metrics.
 
 - [ ] **Build a dashboard and exploration layer.** Add composable dashboards,
   panels, variables, annotations, ad-hoc queries, sharing/export, provisioning

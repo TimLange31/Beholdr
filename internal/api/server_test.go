@@ -249,7 +249,7 @@ func TestIntegrationsEndpointServesTheMonitorSnapshot(t *testing.T) {
 func TestIntegrationsResponseNeverCarriesEndpointsOrCredentials(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"status":"green","cluster_name":"nlziet-prod"}`)
+		_, _ = io.WriteString(w, `{"status":"green","cluster_name":"production-cluster"}`)
 	}))
 	defer backend.Close()
 
@@ -266,7 +266,7 @@ func TestIntegrationsResponseNeverCarriesEndpointsOrCredentials(t *testing.T) {
 		"prom-token-should-never-appear",
 		"elastic-key-should-never-appear",
 		backend.URL,
-		"nlziet-prod",
+		"production-cluster",
 	} {
 		if strings.Contains(body, secret) {
 			t.Fatalf("response leaked %q: %s", secret, body)

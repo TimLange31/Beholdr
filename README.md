@@ -150,7 +150,7 @@ Each request is limited to 2,000 evaluation points and a 16 MiB response.
 
 These thresholds currently produce health states in the API and UI; they do
 not send notifications yet. Missing metrics produce `unknown`, never a green
-status. The initial NLZIET metric profile uses
+status. The default ASP.NET Core metric profile uses
 `aspnetcore_requests_duration_seconds_count` with `code=~"5.."`, divided by
 the same request counter without the status filter and scoped by
 `kubernetes_namespace` and `app_kubernetes_io_name`. Kubernetes signals use
