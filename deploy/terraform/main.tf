@@ -29,6 +29,31 @@ locals {
 
   nginx = var.ingress_class == "nginx"
 
+  # Service-health configuration. Every entry is optional: an empty value is
+  # omitted so Beholdr applies its own default rather than being handed an
+  # empty string it would have to interpret.
+  service_health_env = {
+    BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC   = var.service_http_requests_metric
+    BEHOLDR_SERVICE_HTTP_ERRORS_METRIC     = var.service_http_errors_metric
+    BEHOLDR_SERVICE_HTTP_STATUS_LABEL      = var.service_http_status_label
+    BEHOLDR_SERVICE_APP_NAMESPACE_LABEL    = var.service_app_namespace_label
+    BEHOLDR_SERVICE_APP_SERVICE_LABEL      = var.service_app_service_label
+    BEHOLDR_SERVICE_APP_POD_LABEL          = var.service_app_pod_label
+    BEHOLDR_SERVICE_KUBE_NAMESPACE_LABEL   = var.service_kube_namespace_label
+    BEHOLDR_SERVICE_KUBE_POD_LABEL         = var.service_kube_pod_label
+    BEHOLDR_SERVICE_CPU_BASIS              = var.service_cpu_basis
+    BEHOLDR_SERVICE_ERROR_RATE_WARNING     = try(tostring(var.service_thresholds.error_rate_warning), "")
+    BEHOLDR_SERVICE_ERROR_RATE_CRITICAL    = try(tostring(var.service_thresholds.error_rate_critical), "")
+    BEHOLDR_SERVICE_ERROR_INCREASE_WARNING = try(tostring(var.service_thresholds.error_increase_warning), "")
+    BEHOLDR_SERVICE_ERROR_INCREASE_CRITICAL = try(tostring(var.service_thresholds.error_increase_critical), "")
+    BEHOLDR_SERVICE_CPU_WARNING            = try(tostring(var.service_thresholds.cpu_warning), "")
+    BEHOLDR_SERVICE_CPU_CRITICAL           = try(tostring(var.service_thresholds.cpu_critical), "")
+    BEHOLDR_SERVICE_MEMORY_WARNING         = try(tostring(var.service_thresholds.memory_warning), "")
+    BEHOLDR_SERVICE_MEMORY_CRITICAL        = try(tostring(var.service_thresholds.memory_critical), "")
+    BEHOLDR_SERVICE_FAILING_PODS_WARNING   = try(tostring(var.service_thresholds.failing_pods_warning), "")
+    BEHOLDR_SERVICE_FAILING_PODS_CRITICAL  = try(tostring(var.service_thresholds.failing_pods_critical), "")
+  }
+
   # In edge mode the public hostname is already HTTPS-only at the terminator
   # (Cloudflare "Always Use HTTPS"/automatic rewrites, or an external LB), and
   # the hop from there to this Ingress is plain HTTP. Redirecting to https here
@@ -228,6 +253,27 @@ resource "kubernetes_deployment" "beholdr" {
             name  = "BEHOLDR_INTEGRATION_REQUEST_TIMEOUT"
             value = tostring(var.integration_request_timeout_seconds)
           }
+          env {
+            # Range and instant queries are real Prometheus work, not a
+            # liveness probe: they must not inherit the health-check timeout.
+            name  = "BEHOLDR_PROMETHEUS_QUERY_TIMEOUT"
+            value = tostring(var.prometheus_query_timeout_seconds)
+          }
+          env {
+            name  = "BEHOLDR_SERVICE_METRICS_CACHE_TTL"
+            value = tostring(var.service_metrics_cache_ttl_seconds)
+          }
+          env {
+            name  = "BEHOLDR_SERVICE_MAX_CONCURRENT_QUERIES"
+            value = tostring(var.service_max_concurrent_queries)
+          }
+          dynamic "env" {
+            for_each = { for name, value in local.service_health_env : name => value if value != "" }
+            content {
+              name  = env.key
+              value = env.value
+            }
+          }
 
           dynamic "volume_mount" {
             for_each = local.ca_mounted ? [1] : []
@@ -281,6 +327,10 @@ resource "kubernetes_deployment" "beholdr" {
   }
 
   lifecycle {
+    precondition {
+      condition     = var.prometheus_url != "" || alltrue([for value in values(local.service_health_env) : value == ""])
+      error_message = "Service-health metric/label/threshold settings were supplied without prometheus_url, so nothing would query them. Set prometheus_url, or remove the service_* settings."
+    }
     precondition {
       condition     = var.integration_request_timeout_seconds <= var.integration_check_interval_seconds
       error_message = "integration_request_timeout_seconds must not exceed integration_check_interval_seconds, or a slow backend is still in flight when the next check falls due."

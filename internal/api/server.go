@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io/fs"
@@ -28,12 +29,11 @@ type Server struct {
 // origins permitted to make cross-origin requests; nil/empty disables CORS
 // entirely (the default). "*" may be included to allow any origin, which is
 // only appropriate for local development.
-func NewServer(col *collect.Collector, integrations *integrations.Monitor, corsOrigins []string, log *slog.Logger) *Server {
-	var health *servicehealth.Service
-	if integrations != nil {
-		health = servicehealth.New(integrations, servicehealth.Config{})
-	}
-	return &Server{col: col, integrations: integrations, serviceHealth: health, log: log, corsOrigins: corsOrigins}
+// serviceHealth may be nil, in which case the per-service metrics endpoint
+// reports that Prometheus is not configured. It is built by the caller so an
+// unusable metric profile fails at startup rather than per request.
+func NewServer(col *collect.Collector, integrations *integrations.Monitor, serviceHealth *servicehealth.Service, corsOrigins []string, log *slog.Logger) *Server {
+	return &Server{col: col, integrations: integrations, serviceHealth: serviceHealth, log: log, corsOrigins: corsOrigins}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -221,6 +221,9 @@ func (s *Server) microserviceMetrics(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	// Resolving against the snapshot before querying is what keeps the path
+	// parameters out of the PromQL templates: only the names of Kubernetes
+	// objects the collector actually saw can reach them.
 	if workload == nil {
 		http.Error(w, "microservice not found", http.StatusNotFound)
 		return
@@ -234,16 +237,34 @@ func (s *Server) microserviceMetrics(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Prometheus is not configured", http.StatusServiceUnavailable)
 		return
 	}
-	report, err := s.serviceHealth.Query(r.Context(), *workload, window, time.Now())
-	if errors.Is(err, integrations.ErrPrometheusNotConfigured) {
+
+	// The live pod names let the score pin itself to pods this workload
+	// actually owns; the charts still use the name-shape selector so pods
+	// replaced by earlier rollouts stay in the history.
+	podNames := make([]string, 0, 8)
+	for _, p := range snap.Pods {
+		if p.Namespace == ns && p.Workload == name {
+			podNames = append(podNames, p.Name)
+		}
+	}
+
+	report, err := s.serviceHealth.Query(r.Context(), *workload, podNames, window, time.Now())
+	switch {
+	case err == nil:
+	case errors.Is(err, integrations.ErrPrometheusNotConfigured):
 		http.Error(w, "Prometheus is not configured", http.StatusServiceUnavailable)
 		return
-	}
-	if err != nil {
+	case errors.Is(err, context.Canceled):
+		// The client went away mid-flight; there is nobody to answer.
+		return
+	default:
 		s.log.Warn("service health query failed", "namespace", ns, "service", name, "err", err)
 		http.Error(w, "service metrics unavailable", http.StatusBadGateway)
 		return
 	}
+	// Reports are cached server-side for a short window; letting a browser or
+	// proxy hold one for longer would show an operator a stale severity badge.
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, report)
 }
 

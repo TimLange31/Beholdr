@@ -254,3 +254,104 @@ variable "otel_collector_tls_insecure" {
   type        = bool
   default     = false
 }
+
+# --- service health (Prometheus-backed per-service signals) -------------------
+#
+# Beholdr owns the PromQL templates; these settings name the metrics and labels
+# those templates select on. Every one is optional — leave it unset to take
+# Beholdr's default. A value that is set but unusable stops the pod at startup
+# rather than being silently replaced.
+
+variable "prometheus_query_timeout_seconds" {
+  description = "Per-call timeout for Prometheus range and instant queries. Deliberately separate from integration_request_timeout_seconds: a multi-week range query is normal work and must not inherit the timeout sized for a liveness probe."
+  type        = number
+  default     = 30
+}
+
+variable "service_metrics_cache_ttl_seconds" {
+  description = "How long a completed service-health report is reused. The UI polls this endpoint per open tab, and each uncached report is ten or more Prometheus queries, so this is what keeps a busy incident from becoming load on the Prometheus you are debugging with."
+  type        = number
+  default     = 30
+}
+
+variable "service_max_concurrent_queries" {
+  description = "Upper bound on Prometheus queries in flight from this pod at once, across all callers."
+  type        = number
+  default     = 6
+}
+
+variable "service_http_requests_metric" {
+  description = "Counter of HTTP requests handled, e.g. \"aspnetcore_requests_duration_seconds_count\" (Beholdr's default) or \"http_server_request_duration_seconds_count\" for OpenTelemetry semantic conventions. Empty = Beholdr's default."
+  type        = string
+  default     = ""
+}
+
+variable "service_http_errors_metric" {
+  description = "Optional separate counter of failed requests. Empty means errors are counted from service_http_requests_metric filtered by service_http_status_label =~ \"5..\"."
+  type        = string
+  default     = ""
+}
+
+variable "service_http_status_label" {
+  description = "Label carrying the HTTP response status on the requests metric, e.g. \"code\" (Beholdr's default) or \"http_response_status_code\" under OpenTelemetry conventions."
+  type        = string
+  default     = ""
+}
+
+variable "service_app_namespace_label" {
+  description = "Label carrying the Kubernetes namespace on your application metrics. Depends on your Prometheus relabeling, e.g. \"kubernetes_namespace\" or \"namespace\"."
+  type        = string
+  default     = ""
+}
+
+variable "service_app_service_label" {
+  description = "Label carrying the service name on your application metrics, matched against the workload name, e.g. \"app_kubernetes_io_name\" or \"service_name\". Set to a label whose value actually equals the Deployment name, or the HTTP signals will find nothing."
+  type        = string
+  default     = ""
+}
+
+variable "service_app_pod_label" {
+  description = "Label carrying the pod name on your application metrics. Used to scope HTTP signals when service_app_service_label is not available."
+  type        = string
+  default     = ""
+}
+
+variable "service_kube_namespace_label" {
+  description = "Namespace label on cAdvisor/kube-state-metrics series. Almost always \"namespace\"."
+  type        = string
+  default     = ""
+}
+
+variable "service_kube_pod_label" {
+  description = "Pod label on cAdvisor/kube-state-metrics series. Almost always \"pod\"."
+  type        = string
+  default     = ""
+}
+
+variable "service_cpu_basis" {
+  description = "What container CPU usage is scored against: \"limits\" (default — exceeding it means throttling) or \"requests\" (a scheduling floor, where values well above 100% are normal, so raise service_thresholds accordingly)."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = contains(["", "limits", "requests"], var.service_cpu_basis)
+    error_message = "service_cpu_basis must be \"limits\", \"requests\", or empty for the default."
+  }
+}
+
+variable "service_thresholds" {
+  description = "Health thresholds. Every field is optional; each critical value must be strictly above its warning value (except failing pods, where they may be equal) or the pod refuses to start. Percentages are 0-100; failing pods are counts."
+  type = object({
+    error_rate_warning      = optional(number)
+    error_rate_critical     = optional(number)
+    error_increase_warning  = optional(number)
+    error_increase_critical = optional(number)
+    cpu_warning             = optional(number)
+    cpu_critical            = optional(number)
+    memory_warning          = optional(number)
+    memory_critical         = optional(number)
+    failing_pods_warning    = optional(number)
+    failing_pods_critical   = optional(number)
+  })
+  default = {}
+}

@@ -27,8 +27,12 @@ production-ready release; **P2** is planned follow-up.
   container-build quality gates.
 - [x] Read-only Prometheus, Elasticsearch, and OpenTelemetry Collector health
   integrations with provider-scoped TLS and secret-backed credentials.
-- [x] Fixed, bounded per-service PromQL range queries and charts for HTTP error
-  rate/week comparison, CPU, memory, and failing pods.
+- [x] Fixed, bounded per-service PromQL queries and charts for HTTP error
+  rate/week comparison, CPU, memory, and failing pods — configurable metric and
+  label profile, thresholds validated at startup, severity scored from an
+  instant query so it does not vary with the selected chart window, and reports
+  cached, de-duplicated and concurrency-bounded so the UI cannot amplify load
+  onto Prometheus.
 
 ## P0 — remaining release blockers
 

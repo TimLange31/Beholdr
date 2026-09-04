@@ -59,6 +59,11 @@ export interface IntegrationStatus {
 
 export type ServiceSeverity = "unknown" | "healthy" | "warning" | "critical";
 
+// "no_data" means the metric does not exist for this workload (no memory limit
+// set, no HTTP traffic); "error" means the query itself failed. Only the second
+// makes the service's aggregate state unknown.
+export type ServiceSignalState = "ok" | "no_data" | "error";
+
 export interface ServiceMetricLine {
   key: string;
   label: string;
@@ -73,9 +78,11 @@ export interface ServiceMetricSignal {
   current?: number;
   previous?: number;
   difference?: number;
-  warning: number;
+  /** Absent when there is no meaningful warning band (a single-replica service). */
+  warning?: number;
   critical: number;
   severity: ServiceSeverity;
+  state: ServiceSignalState;
   lines: ServiceMetricLine[];
   points: Point[];
   error?: string;
@@ -90,4 +97,7 @@ export interface ServiceMetricsReport {
   step: number;
   severity: ServiceSeverity;
   signals: ServiceMetricSignal[];
+  /** False on windows longer than a week, where a week-before overlay would
+   *  overlap the current series instead of comparing against it. */
+  compared: boolean;
 }

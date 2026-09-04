@@ -2,6 +2,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -17,6 +18,7 @@ type Config struct {
 	Kubeconfig                string        // path when KubeMode != in-cluster
 	CORSOrigins               []string      // explicit CORS allowlist; empty = CORS disabled (the default)
 	RequestTimout             time.Duration // per-call timeout to the API server
+	PrometheusQueryTimeout    time.Duration // per-call timeout for Prometheus range/instant queries
 	PrometheusURL             string        // Prometheus base URL; the check calls /-/ready beneath it
 	PrometheusBearerToken     string        // optional bearer token; never exposed through the API
 	ElasticsearchURL          string        // Elasticsearch base URL; the check calls /_cluster/health beneath it
@@ -31,6 +33,54 @@ type Config struct {
 	PrometheusTLS    TLSConfig
 	ElasticsearchTLS TLSConfig
 	OTelCollectorTLS TLSConfig
+
+	// ServiceHealth configures the Prometheus-backed per-service signals.
+	ServiceHealth ServiceHealthConfig
+
+	// Problems collects configuration that was supplied but unusable — an
+	// unparseable threshold, say. Load never guesses what was meant: the
+	// process refuses to start instead, because a silently ignored threshold
+	// is a health badge that is quietly wrong.
+	Problems []string
+}
+
+// ServiceHealthConfig names the metrics, labels and thresholds the per-service
+// health signals are built from. It is transport- and package-agnostic so
+// config keeps no dependency on the servicehealth package; cmd/beholdr adapts
+// it, the same way it does for TLSConfig.
+type ServiceHealthConfig struct {
+	HTTPRequestsMetric string
+	HTTPErrorsMetric   string
+	HTTPStatusLabel    string
+	AppNamespaceLabel  string
+	AppServiceLabel    string
+	AppPodLabel        string
+	KubeNamespaceLabel string
+	KubePodLabel       string
+	// CPUBasis is "limits" or "requests" — what CPU usage is scored against.
+	CPUBasis string
+
+	ErrorRateWarning      float64
+	ErrorRateCritical     float64
+	ErrorIncreaseWarning  float64
+	ErrorIncreaseCritical float64
+	CPUWarning            float64
+	CPUCritical           float64
+	MemoryWarning         float64
+	MemoryCritical        float64
+	FailingPodsWarning    float64
+	FailingPodsCritical   float64
+
+	CacheTTL             time.Duration
+	MaxConcurrentQueries int
+}
+
+// Validate reports configuration that was supplied but could not be used.
+func (c Config) Validate() error {
+	if len(c.Problems) == 0 {
+		return nil
+	}
+	return fmt.Errorf("invalid configuration: %s", strings.Join(c.Problems, "; "))
 }
 
 // TLSConfig is how one outbound integration verifies its backend.
@@ -40,7 +90,8 @@ type TLSConfig struct {
 }
 
 func Load() Config {
-	return Config{
+	var problems []string
+	cfg := Config{
 		Addr:         env("BEHOLDR_ADDR", ":8000"),
 		PollInterval: time.Duration(envInt("BEHOLDR_POLL_INTERVAL", 15)) * time.Second,
 		HistorySize:  envInt("BEHOLDR_HISTORY_SIZE", 240),
@@ -59,10 +110,55 @@ func Load() Config {
 		OTelCollectorHealthURL:    env("BEHOLDR_OTEL_COLLECTOR_HEALTH_URL", ""),
 		IntegrationCheckInterval:  time.Duration(envInt("BEHOLDR_INTEGRATION_CHECK_INTERVAL", 30)) * time.Second,
 		IntegrationRequestTimeout: time.Duration(envInt("BEHOLDR_INTEGRATION_REQUEST_TIMEOUT", 5)) * time.Second,
+		PrometheusQueryTimeout:    time.Duration(envInt("BEHOLDR_PROMETHEUS_QUERY_TIMEOUT", 30)) * time.Second,
 		PrometheusTLS:             tlsConfig("BEHOLDR_PROMETHEUS"),
 		ElasticsearchTLS:          tlsConfig("BEHOLDR_ELASTICSEARCH"),
 		OTelCollectorTLS:          tlsConfig("BEHOLDR_OTEL_COLLECTOR"),
 	}
+	cfg.ServiceHealth = ServiceHealthConfig{
+		HTTPRequestsMetric: env("BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC", ""),
+		HTTPErrorsMetric:   env("BEHOLDR_SERVICE_HTTP_ERRORS_METRIC", ""),
+		HTTPStatusLabel:    env("BEHOLDR_SERVICE_HTTP_STATUS_LABEL", ""),
+		AppNamespaceLabel:  env("BEHOLDR_SERVICE_APP_NAMESPACE_LABEL", ""),
+		AppServiceLabel:    env("BEHOLDR_SERVICE_APP_SERVICE_LABEL", ""),
+		AppPodLabel:        env("BEHOLDR_SERVICE_APP_POD_LABEL", ""),
+		KubeNamespaceLabel: env("BEHOLDR_SERVICE_KUBE_NAMESPACE_LABEL", ""),
+		KubePodLabel:       env("BEHOLDR_SERVICE_KUBE_POD_LABEL", ""),
+		CPUBasis:           env("BEHOLDR_SERVICE_CPU_BASIS", ""),
+
+		ErrorRateWarning:      envFloat("BEHOLDR_SERVICE_ERROR_RATE_WARNING", &problems),
+		ErrorRateCritical:     envFloat("BEHOLDR_SERVICE_ERROR_RATE_CRITICAL", &problems),
+		ErrorIncreaseWarning:  envFloat("BEHOLDR_SERVICE_ERROR_INCREASE_WARNING", &problems),
+		ErrorIncreaseCritical: envFloat("BEHOLDR_SERVICE_ERROR_INCREASE_CRITICAL", &problems),
+		CPUWarning:            envFloat("BEHOLDR_SERVICE_CPU_WARNING", &problems),
+		CPUCritical:           envFloat("BEHOLDR_SERVICE_CPU_CRITICAL", &problems),
+		MemoryWarning:         envFloat("BEHOLDR_SERVICE_MEMORY_WARNING", &problems),
+		MemoryCritical:        envFloat("BEHOLDR_SERVICE_MEMORY_CRITICAL", &problems),
+		FailingPodsWarning:    envFloat("BEHOLDR_SERVICE_FAILING_PODS_WARNING", &problems),
+		FailingPodsCritical:   envFloat("BEHOLDR_SERVICE_FAILING_PODS_CRITICAL", &problems),
+
+		CacheTTL:             time.Duration(envInt("BEHOLDR_SERVICE_METRICS_CACHE_TTL", 30)) * time.Second,
+		MaxConcurrentQueries: envInt("BEHOLDR_SERVICE_MAX_CONCURRENT_QUERIES", 6),
+	}
+	cfg.Problems = problems
+	return cfg
+}
+
+// envFloat returns 0 when the variable is unset — "0" means "take the default"
+// throughout ServiceHealthConfig. A value that is set but unparseable is
+// recorded as a problem rather than falling back, so a mistyped threshold stops
+// the process instead of quietly reverting to a different one.
+func envFloat(k string, problems *[]string) float64 {
+	v, ok := os.LookupEnv(k)
+	if !ok || strings.TrimSpace(v) == "" {
+		return 0
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+	if err != nil {
+		*problems = append(*problems, fmt.Sprintf("%s is not a number: %q", k, v))
+		return 0
+	}
+	return f
 }
 
 func tlsConfig(prefix string) TLSConfig {

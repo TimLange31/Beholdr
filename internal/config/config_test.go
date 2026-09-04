@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -105,5 +106,66 @@ func TestInsecureTLSDefaultsToOffOnGarbageInput(t *testing.T) {
 		if !Load().ElasticsearchTLS.Insecure {
 			t.Errorf("%q should enable insecure TLS", v)
 		}
+	}
+}
+
+func TestServiceHealthDefaultsAreUnsetSoThePackageOwnsThem(t *testing.T) {
+	cfg := Load()
+	sh := cfg.ServiceHealth
+	if sh.HTTPRequestsMetric != "" || sh.KubePodLabel != "" || sh.CPUBasis != "" {
+		t.Fatalf("unset service-health fields must stay empty so servicehealth applies its own defaults: %+v", sh)
+	}
+	if sh.ErrorRateWarning != 0 || sh.CPUCritical != 0 {
+		t.Fatalf("unset thresholds must be zero: %+v", sh)
+	}
+	if sh.CacheTTL != 30*time.Second || sh.MaxConcurrentQueries != 6 {
+		t.Fatalf("unexpected query-shaping defaults: %+v", sh)
+	}
+	if cfg.PrometheusQueryTimeout != 30*time.Second {
+		t.Fatalf("query timeout must not inherit the 5s health-check timeout: %v", cfg.PrometheusQueryTimeout)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("default configuration must be valid: %v", err)
+	}
+}
+
+func TestServiceHealthOverridesAreRead(t *testing.T) {
+	t.Setenv("BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC", "http_server_request_duration_seconds_count")
+	t.Setenv("BEHOLDR_SERVICE_HTTP_STATUS_LABEL", "http_response_status_code")
+	t.Setenv("BEHOLDR_SERVICE_APP_SERVICE_LABEL", "service_name")
+	t.Setenv("BEHOLDR_SERVICE_CPU_BASIS", "requests")
+	t.Setenv("BEHOLDR_SERVICE_CPU_WARNING", "150")
+	t.Setenv("BEHOLDR_SERVICE_CPU_CRITICAL", "300")
+	t.Setenv("BEHOLDR_PROMETHEUS_QUERY_TIMEOUT", "45")
+
+	cfg := Load()
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	sh := cfg.ServiceHealth
+	if sh.HTTPRequestsMetric != "http_server_request_duration_seconds_count" ||
+		sh.HTTPStatusLabel != "http_response_status_code" ||
+		sh.AppServiceLabel != "service_name" || sh.CPUBasis != "requests" {
+		t.Fatalf("metric profile not read: %+v", sh)
+	}
+	if sh.CPUWarning != 150 || sh.CPUCritical != 300 {
+		t.Fatalf("thresholds not read: %+v", sh)
+	}
+	if cfg.PrometheusQueryTimeout != 45*time.Second {
+		t.Fatalf("query timeout not read: %v", cfg.PrometheusQueryTimeout)
+	}
+}
+
+// A mistyped threshold must stop the process. Falling back to the default
+// would leave an operator believing they had set a threshold they had not.
+func TestUnparseableThresholdIsRefusedNotIgnored(t *testing.T) {
+	t.Setenv("BEHOLDR_SERVICE_MEMORY_CRITICAL", "ninety-five")
+	cfg := Load()
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("want a configuration error")
+	}
+	if !strings.Contains(err.Error(), "BEHOLDR_SERVICE_MEMORY_CRITICAL") {
+		t.Fatalf("error should name the variable: %v", err)
 	}
 }
