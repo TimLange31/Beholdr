@@ -13,6 +13,10 @@
 
   const state = (provider: IntegrationProvider) => {
     if (!provider.configured) return { label: "Not configured", style: "text-slate-400 bg-slate-500/10 border-slate-500/30" };
+    // Reachable and healthy are different questions: a backend that answers
+    // while calling itself unhealthy must not read as green.
+    if (provider.reachable && provider.degraded)
+      return { label: "Degraded", style: "text-amber-300 bg-amber-500/10 border-amber-500/30" };
     if (provider.reachable) return { label: "Connected", style: "text-emerald-300 bg-emerald-500/10 border-emerald-500/30" };
     return { label: "Unavailable", style: "text-rose-300 bg-rose-500/10 border-rose-500/30" };
   };
@@ -48,11 +52,26 @@
         </div>
 
         {#if provider.reachable}
-          <p class="mt-5 text-sm text-slate-300">Health check completed in {provider.latency_ms} ms.</p>
+          <p class="mt-5 text-sm {provider.degraded ? 'text-amber-300' : 'text-slate-300'}">
+            {provider.detail ?? `Health check completed in ${provider.latency_ms} ms.`}
+          </p>
+          {#if provider.detail}
+            <p class="mt-1 text-xs text-slate-500">Answered in {provider.latency_ms} ms.</p>
+          {/if}
         {:else if provider.error}
           <p class="mt-5 text-sm text-rose-300">{provider.error}</p>
         {:else}
           <p class="mt-5 text-sm text-slate-400">Add the endpoint through Beholdr's deployment configuration.</p>
+        {/if}
+
+        {#if provider.tls_skip_verify}
+          <p class="mt-3 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+            <span aria-hidden="true">&#9888;</span>
+            <span>
+              Certificate verification is disabled for this backend, so the connection is
+              encrypted but not authenticated. Supply a CA bundle instead.
+            </span>
+          </p>
         {/if}
       </section>
     {/each}

@@ -82,6 +82,20 @@ spec:
             # Add BEHOLDR_PROMETHEUS_BEARER_TOKEN and
             # BEHOLDR_ELASTICSEARCH_API_KEY with secretKeyRef entries when
             # authentication is required. Never put credentials in these URLs.
+            #
+            # Outbound TLS: when a backend presents a certificate the system
+            # trust store does not know (an ECK-issued Elasticsearch cert, a
+            # Cloudflare Origin CA cert, a corporate PKI), mount the CA bundle
+            # and point at it. Uncomment the volume/volumeMount below too.
+            # - { name: BEHOLDR_ELASTICSEARCH_CA_FILE, value: "/etc/beholdr/ca/elastic-ca.crt" }
+            # - { name: BEHOLDR_PROMETHEUS_CA_FILE, value: "/etc/beholdr/ca/prometheus-ca.crt" }
+            #
+            # Last resort only, when the CA genuinely cannot be obtained: this
+            # is logged at WARN on startup and the UI marks the provider
+            # unverified. Prefer the CA bundle above.
+            # - { name: BEHOLDR_ELASTICSEARCH_TLS_INSECURE, value: "true" }
+          # volumeMounts:
+          #   - { name: integration-ca, mountPath: /etc/beholdr/ca, readOnly: true }
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
             limits: { cpu: "500m", memory: "512Mi" }
@@ -98,6 +112,9 @@ spec:
             httpGet: { path: /ready, port: 8000 }
             initialDelaySeconds: 5
             periodSeconds: 10
+      # volumes:
+      #   - name: integration-ca
+      #     secret: { secretName: beholdr-integration-ca, defaultMode: 0444 }
 ---
 apiVersion: v1
 kind: Service
@@ -118,13 +135,28 @@ metadata:
   name: beholdr
   namespace: beholdr
   annotations:
-    # TLS: request a certificate from cert-manager (or point tls.secretName
-    # below at a secret you manage yourself). Do not serve this over plain
-    # HTTP in production — it exposes cluster topology, pod names, and
-    # resource usage.
+    # TLS, option A — terminate in the cluster (the default below): request a
+    # certificate from cert-manager, or point tls.secretName at a secret you
+    # manage yourself (a Cloudflare Origin CA certificate belongs here too, for
+    # Cloudflare Full / Full (strict)). Do not serve this over plain HTTP in
+    # production — it exposes cluster topology, pod names, and resource usage.
     cert-manager.io/cluster-issuer: letsencrypt-prod  # <-- replace or remove if managing certs another way
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    #
+    # TLS, option B — terminate at the edge (Cloudflare Flexible SSL, a
+    # Cloudflare Tunnel, an external load balancer). The cluster then needs no
+    # certificate or key: delete the cert-manager annotation and the whole
+    # spec.tls block below, and swap the two redirect annotations above for
+    # these. Switching the redirects off is not optional — the edge already
+    # rewrites http to https, so an origin-side redirect bounces back to the
+    # edge, which re-requests over http: ERR_TOO_MANY_REDIRECTS.
+    #   nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    #   nginx.ingress.kubernetes.io/force-ssl-redirect: "false"
+    # In that mode the origin answers plain HTTP, so restrict who can reach it;
+    # otherwise anything that routes to this Ingress bypasses the edge and the
+    # authentication in front of it. Current list: https://www.cloudflare.com/ips/
+    #   nginx.ingress.kubernetes.io/whitelist-source-range: "173.245.48.0/20,103.21.244.0/22,..."
     # Authentication: Beholdr has no built-in login, so an OIDC-aware proxy
     # must sit in front of it. Example using oauth2-proxy as an
     # auth_request subrequest (https://kubernetes.github.io/ingress-nginx/user-guide/nginx-configuration/annotations/#auth):

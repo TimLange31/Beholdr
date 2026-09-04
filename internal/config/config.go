@@ -17,13 +17,26 @@ type Config struct {
 	Kubeconfig                string        // path when KubeMode != in-cluster
 	CORSOrigins               []string      // explicit CORS allowlist; empty = CORS disabled (the default)
 	RequestTimout             time.Duration // per-call timeout to the API server
-	PrometheusURL             string        // Prometheus-compatible API base URL
+	PrometheusURL             string        // Prometheus base URL; the check calls /-/ready beneath it
 	PrometheusBearerToken     string        // optional bearer token; never exposed through the API
-	ElasticsearchURL          string        // Elasticsearch API base URL
+	ElasticsearchURL          string        // Elasticsearch base URL; the check calls /_cluster/health beneath it
 	ElasticsearchAPIKey       string        // optional API key; never exposed through the API
 	OTelCollectorHealthURL    string        // Collector health_check extension URL
 	IntegrationCheckInterval  time.Duration // how often external systems are checked
 	IntegrationRequestTimeout time.Duration // per-call timeout for external systems
+
+	// Outbound TLS trust, per integration. CAFile extends the system trust
+	// store (private CA, ECK-issued cert, Cloudflare Origin CA); Insecure
+	// disables verification entirely and is logged loudly at startup.
+	PrometheusTLS    TLSConfig
+	ElasticsearchTLS TLSConfig
+	OTelCollectorTLS TLSConfig
+}
+
+// TLSConfig is how one outbound integration verifies its backend.
+type TLSConfig struct {
+	CAFile   string // PEM bundle appended to the system roots; empty = system roots only
+	Insecure bool   // skip verification entirely — never in production
 }
 
 func Load() Config {
@@ -46,6 +59,16 @@ func Load() Config {
 		OTelCollectorHealthURL:    env("BEHOLDR_OTEL_COLLECTOR_HEALTH_URL", ""),
 		IntegrationCheckInterval:  time.Duration(envInt("BEHOLDR_INTEGRATION_CHECK_INTERVAL", 30)) * time.Second,
 		IntegrationRequestTimeout: time.Duration(envInt("BEHOLDR_INTEGRATION_REQUEST_TIMEOUT", 5)) * time.Second,
+		PrometheusTLS:             tlsConfig("BEHOLDR_PROMETHEUS"),
+		ElasticsearchTLS:          tlsConfig("BEHOLDR_ELASTICSEARCH"),
+		OTelCollectorTLS:          tlsConfig("BEHOLDR_OTEL_COLLECTOR"),
+	}
+}
+
+func tlsConfig(prefix string) TLSConfig {
+	return TLSConfig{
+		CAFile:   env(prefix+"_CA_FILE", ""),
+		Insecure: envBool(prefix+"_TLS_INSECURE", false),
 	}
 }
 
@@ -60,6 +83,18 @@ func envInt(k string, def int) int {
 	if v, ok := os.LookupEnv(k); ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
+		}
+	}
+	return def
+}
+
+// envBool accepts the strconv.ParseBool vocabulary (1/t/T/true/TRUE, 0/f/false,
+// ...). Anything unparseable falls back to the default rather than silently
+// reading as true, so a typo can never switch verification off.
+func envBool(k string, def bool) bool {
+	if v, ok := os.LookupEnv(k); ok {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			return b
 		}
 	}
 	return def

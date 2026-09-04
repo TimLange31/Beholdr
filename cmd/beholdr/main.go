@@ -37,9 +37,12 @@ func main() {
 	integrationMonitor := integrations.New(integrations.Config{
 		PrometheusURL:         cfg.PrometheusURL,
 		PrometheusBearerToken: cfg.PrometheusBearerToken,
+		PrometheusTLS:         integrationTLS(cfg.PrometheusTLS),
 		ElasticsearchURL:      cfg.ElasticsearchURL,
 		ElasticsearchAPIKey:   cfg.ElasticsearchAPIKey,
+		ElasticsearchTLS:      integrationTLS(cfg.ElasticsearchTLS),
 		CollectorHealthURL:    cfg.OTelCollectorHealthURL,
+		CollectorTLS:          integrationTLS(cfg.OTelCollectorTLS),
 		Interval:              cfg.IntegrationCheckInterval,
 		Timeout:               cfg.IntegrationRequestTimeout,
 	}, log)
@@ -69,4 +72,10 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
+}
+
+// integrationTLS adapts the config package's transport-agnostic TLS settings to
+// the integrations package, keeping config free of any dependency on it.
+func integrationTLS(t config.TLSConfig) integrations.TLS {
+	return integrations.TLS{CAFile: t.CAFile, Insecure: t.Insecure}
 }

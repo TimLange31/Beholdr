@@ -41,8 +41,14 @@ export interface IntegrationProvider {
   signal: string;
   configured: boolean;
   reachable: boolean;
+  /** The backend answered but reported itself unhealthy (e.g. an ES red cluster). */
+  degraded?: boolean;
+  /** Certificate verification is switched off for this backend. */
+  tls_skip_verify?: boolean;
   checked_at: number;
   latency_ms: number;
+  /** Sanitized health summary from the backend; never raw upstream text. */
+  detail?: string;
   error?: string;
 }
 
