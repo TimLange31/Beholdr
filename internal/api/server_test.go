@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/delangetimm/beholdr/internal/collect"
+	"github.com/delangetimm/beholdr/internal/integrations"
 	"github.com/delangetimm/beholdr/internal/k8s"
 )
 
@@ -49,7 +51,18 @@ func newTestServer(t *testing.T, corsOrigins []string, collected bool, srcErr er
 		cancel()
 		col.Run(ctx)
 	}
-	return NewServer(col, corsOrigins, testLogger())
+	return NewServer(col, nil, corsOrigins, testLogger())
+}
+
+// newTestServerWithMonitor wires a real integration Monitor, already checked
+// once, so the endpoint is exercised end-to-end rather than through its
+// nil-monitor shortcut.
+func newTestServerWithMonitor(t *testing.T, cfg integrations.Config) *Server {
+	t.Helper()
+	col := collect.New(&fakeSource{}, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+	mon := integrations.New(cfg, testLogger())
+	mon.Check(context.Background())
+	return NewServer(col, mon, nil, testLogger())
 }
 
 func do(s *Server, method, path, origin string) *httptest.ResponseRecorder {
@@ -107,6 +120,23 @@ func TestHealthAlways200AndReportsError(t *testing.T) {
 	}
 	if errMsg, _ := body["last_error"].(string); errMsg == "" {
 		t.Error("want last_error to be surfaced in the health payload")
+	}
+}
+
+func TestIntegrationsAvailableBeforeClusterCollection(t *testing.T) {
+	s := newTestServer(t, nil, false, nil)
+	w := do(s, http.MethodGet, "/api/integrations", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200 before the Kubernetes collector is ready, got %d", w.Code)
+	}
+	var body struct {
+		Providers []any `json:"providers"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Providers == nil {
+		t.Fatal("providers must be an empty array, not null")
 	}
 }
 
@@ -172,5 +202,72 @@ func TestOptionsPreflightReturnsNoContent(t *testing.T) {
 	w := do(s, http.MethodOptions, "/api/cluster", "https://dashboard.example.com")
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("want 204 for an OPTIONS preflight, got %d", w.Code)
+	}
+}
+
+func TestIntegrationsEndpointServesTheMonitorSnapshot(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer backend.Close()
+
+	s := newTestServerWithMonitor(t, integrations.Config{
+		CollectorHealthURL: backend.URL,
+		Timeout:            5 * time.Second,
+	})
+	w := do(s, http.MethodGet, "/api/integrations", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d", w.Code)
+	}
+
+	var snap integrations.Snapshot
+	if err := json.Unmarshal(w.Body.Bytes(), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Providers) != 3 || snap.UpdatedAt == 0 {
+		t.Fatalf("endpoint did not serve a completed snapshot: %+v", snap)
+	}
+	var collector integrations.ProviderStatus
+	for _, p := range snap.Providers {
+		if p.Name == "otel-collector" {
+			collector = p
+		}
+	}
+	if !collector.Reachable {
+		t.Fatalf("the configured provider should be reachable: %+v", collector)
+	}
+}
+
+// The response is the only thing that leaves the process, so assert on the
+// serialized bytes: no endpoint, credential or upstream body may appear in it,
+// whatever fields are added to ProviderStatus later.
+func TestIntegrationsResponseNeverCarriesEndpointsOrCredentials(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"status":"green","cluster_name":"nlziet-prod"}`)
+	}))
+	defer backend.Close()
+
+	s := newTestServerWithMonitor(t, integrations.Config{
+		PrometheusURL:         backend.URL,
+		PrometheusBearerToken: "prom-token-should-never-appear",
+		ElasticsearchURL:      backend.URL,
+		ElasticsearchAPIKey:   "elastic-key-should-never-appear",
+		Timeout:               5 * time.Second,
+	})
+	body := do(s, http.MethodGet, "/api/integrations", "").Body.String()
+
+	for _, secret := range []string{
+		"prom-token-should-never-appear",
+		"elastic-key-should-never-appear",
+		backend.URL,
+		"nlziet-prod",
+	} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("response leaked %q: %s", secret, body)
+		}
+	}
+	if !strings.Contains(body, "cluster status green") {
+		t.Fatalf("expected the sanitized health detail to survive: %s", body)
 	}
 }

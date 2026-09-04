@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestLoadDefaultsAreSecure(t *testing.T) {
 	t.Setenv("BEHOLDR_CORS_ORIGINS", "")
@@ -32,5 +35,75 @@ func TestEnvIntFallsBackOnInvalidValue(t *testing.T) {
 	cfg := Load()
 	if cfg.PollInterval.Seconds() != 15 {
 		t.Errorf("want default poll interval on invalid input, got %v", cfg.PollInterval)
+	}
+}
+
+func TestLoadObservabilityIntegrations(t *testing.T) {
+	t.Setenv("BEHOLDR_PROMETHEUS_URL", "https://prometheus.example.com")
+	t.Setenv("BEHOLDR_PROMETHEUS_BEARER_TOKEN", "prom-secret")
+	t.Setenv("BEHOLDR_ELASTICSEARCH_URL", "https://elastic.example.com")
+	t.Setenv("BEHOLDR_ELASTICSEARCH_API_KEY", "elastic-secret")
+	t.Setenv("BEHOLDR_OTEL_COLLECTOR_HEALTH_URL", "http://otel-collector:13133/")
+	t.Setenv("BEHOLDR_INTEGRATION_CHECK_INTERVAL", "45")
+	t.Setenv("BEHOLDR_INTEGRATION_REQUEST_TIMEOUT", "7")
+
+	cfg := Load()
+	if cfg.PrometheusURL != "https://prometheus.example.com" {
+		t.Errorf("unexpected Prometheus URL %q", cfg.PrometheusURL)
+	}
+	if cfg.PrometheusBearerToken != "prom-secret" {
+		t.Error("Prometheus bearer token was not loaded")
+	}
+	if cfg.ElasticsearchURL != "https://elastic.example.com" {
+		t.Errorf("unexpected Elasticsearch URL %q", cfg.ElasticsearchURL)
+	}
+	if cfg.ElasticsearchAPIKey != "elastic-secret" {
+		t.Error("Elasticsearch API key was not loaded")
+	}
+	if cfg.OTelCollectorHealthURL != "http://otel-collector:13133/" {
+		t.Errorf("unexpected Collector health URL %q", cfg.OTelCollectorHealthURL)
+	}
+	if cfg.IntegrationCheckInterval != 45*time.Second {
+		t.Errorf("unexpected integration interval %s", cfg.IntegrationCheckInterval)
+	}
+	if cfg.IntegrationRequestTimeout != 7*time.Second {
+		t.Errorf("unexpected integration timeout %s", cfg.IntegrationRequestTimeout)
+	}
+}
+
+func TestLoadIntegrationTLSSettings(t *testing.T) {
+	t.Setenv("BEHOLDR_ELASTICSEARCH_CA_FILE", "/etc/beholdr/ca/elastic.pem")
+	t.Setenv("BEHOLDR_ELASTICSEARCH_TLS_INSECURE", "true")
+	t.Setenv("BEHOLDR_PROMETHEUS_CA_FILE", "/etc/beholdr/ca/prom.pem")
+
+	cfg := Load()
+	if cfg.ElasticsearchTLS.CAFile != "/etc/beholdr/ca/elastic.pem" {
+		t.Errorf("unexpected Elasticsearch CA file %q", cfg.ElasticsearchTLS.CAFile)
+	}
+	if !cfg.ElasticsearchTLS.Insecure {
+		t.Error("BEHOLDR_ELASTICSEARCH_TLS_INSECURE was not honoured")
+	}
+	if cfg.PrometheusTLS.CAFile != "/etc/beholdr/ca/prom.pem" {
+		t.Errorf("unexpected Prometheus CA file %q", cfg.PrometheusTLS.CAFile)
+	}
+	if cfg.PrometheusTLS.Insecure || cfg.OTelCollectorTLS.Insecure {
+		t.Error("TLS verification must stay on unless explicitly disabled")
+	}
+}
+
+// A typo must never be the thing that switches certificate verification off.
+func TestInsecureTLSDefaultsToOffOnGarbageInput(t *testing.T) {
+	for _, v := range []string{"", "yes", "TRUE!", "on", "enabled"} {
+		t.Setenv("BEHOLDR_ELASTICSEARCH_TLS_INSECURE", v)
+		if Load().ElasticsearchTLS.Insecure {
+			t.Errorf("%q must not enable insecure TLS", v)
+		}
+	}
+	// Surrounding whitespace is tolerated: YAML block scalars add it easily.
+	for _, v := range []string{"true", "TRUE", "1", "t", " true "} {
+		t.Setenv("BEHOLDR_ELASTICSEARCH_TLS_INSECURE", v)
+		if !Load().ElasticsearchTLS.Insecure {
+			t.Errorf("%q should enable insecure TLS", v)
+		}
 	}
 }

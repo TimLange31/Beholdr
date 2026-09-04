@@ -14,6 +14,7 @@ import (
 	"github.com/delangetimm/beholdr/internal/api"
 	"github.com/delangetimm/beholdr/internal/collect"
 	"github.com/delangetimm/beholdr/internal/config"
+	"github.com/delangetimm/beholdr/internal/integrations"
 	"github.com/delangetimm/beholdr/internal/k8s"
 )
 
@@ -33,15 +34,28 @@ func main() {
 		client, cfg.PollInterval, cfg.RequestTimout, cfg.HistorySize,
 		func() bool { return client.MetricsAvailable }, log,
 	)
+	integrationMonitor := integrations.New(integrations.Config{
+		PrometheusURL:         cfg.PrometheusURL,
+		PrometheusBearerToken: cfg.PrometheusBearerToken,
+		PrometheusTLS:         integrationTLS(cfg.PrometheusTLS),
+		ElasticsearchURL:      cfg.ElasticsearchURL,
+		ElasticsearchAPIKey:   cfg.ElasticsearchAPIKey,
+		ElasticsearchTLS:      integrationTLS(cfg.ElasticsearchTLS),
+		CollectorHealthURL:    cfg.OTelCollectorHealthURL,
+		CollectorTLS:          integrationTLS(cfg.OTelCollectorTLS),
+		Interval:              cfg.IntegrationCheckInterval,
+		Timeout:               cfg.IntegrationRequestTimeout,
+	}, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	go col.Run(ctx)
+	go integrationMonitor.Run(ctx)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.NewServer(col, cfg.CORSOrigins, log).Handler(),
+		Handler:           api.NewServer(col, integrationMonitor, cfg.CORSOrigins, log).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -58,4 +72,10 @@ func main() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutCtx)
+}
+
+// integrationTLS adapts the config package's transport-agnostic TLS settings to
+// the integrations package, keeping config free of any dependency on it.
+func integrationTLS(t config.TLSConfig) integrations.TLS {
+	return integrations.TLS{CAFile: t.CAFile, Insecure: t.Insecure}
 }

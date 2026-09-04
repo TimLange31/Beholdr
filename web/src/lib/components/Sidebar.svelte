@@ -5,6 +5,7 @@
     { href: "/", label: "Cluster", icon: "M3 12h18M3 6h18M3 18h18" },
     { href: "/nodes", label: "Nodes", icon: "M4 6h16v4H4zM4 14h16v4H4z" },
     { href: "/microservices", label: "Microservices", icon: "M12 2l4 7-4 7-4-7z M12 14l4 7H8z" },
+    { href: "/observability", label: "Observability", icon: "M4 17l4-5 4 3 5-8 3 4" },
   ];
 
   const active = (href: string) =>
@@ -17,7 +18,7 @@
       <div class="grid h-8 w-8 place-items-center rounded-lg bg-gradient-to-br from-indigo-500 to-violet-600 text-sm font-bold">B</div>
       <div>
         <div class="text-lg font-semibold leading-none">Beholdr</div>
-        <div class="text-[11px] text-slate-400">k8s observer</div>
+        <div class="text-[11px] text-slate-400">observability control plane</div>
       </div>
     </div>
   </div>

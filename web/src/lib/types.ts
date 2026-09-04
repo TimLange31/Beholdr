@@ -35,3 +35,24 @@ export interface Health {
   last_error_at: number;
   metrics_available: boolean;
 }
+
+export interface IntegrationProvider {
+  name: string;
+  signal: string;
+  configured: boolean;
+  reachable: boolean;
+  /** The backend answered but reported itself unhealthy (e.g. an ES red cluster). */
+  degraded?: boolean;
+  /** Certificate verification is switched off for this backend. */
+  tls_skip_verify?: boolean;
+  checked_at: number;
+  latency_ms: number;
+  /** Sanitized health summary from the backend; never raw upstream text. */
+  detail?: string;
+  error?: string;
+}
+
+export interface IntegrationStatus {
+  updated_at: number;
+  providers: IntegrationProvider[];
+}

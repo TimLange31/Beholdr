@@ -16,6 +16,38 @@ terraform {
 locals {
   name   = "beholdr"
   labels = { "app.kubernetes.io/name" = "beholdr", "app.kubernetes.io/part-of" = "beholdr" }
+
+  # Outbound TLS trust. One Secret holds every CA bundle Beholdr needs to talk
+  # to the telemetry backends; each provider points at a key inside it.
+  ca_mount_path = "/etc/beholdr/ca"
+  ca_mounted    = var.integration_ca_secret_name != ""
+  ca_file = {
+    prometheus    = local.ca_mounted && var.prometheus_ca_secret_key != "" ? "${local.ca_mount_path}/${var.prometheus_ca_secret_key}" : ""
+    elasticsearch = local.ca_mounted && var.elasticsearch_ca_secret_key != "" ? "${local.ca_mount_path}/${var.elasticsearch_ca_secret_key}" : ""
+    otel          = local.ca_mounted && var.otel_collector_ca_secret_key != "" ? "${local.ca_mount_path}/${var.otel_collector_ca_secret_key}" : ""
+  }
+
+  nginx = var.ingress_class == "nginx"
+
+  # In edge mode the public hostname is already HTTPS-only at the terminator
+  # (Cloudflare "Always Use HTTPS"/automatic rewrites, or an external LB), and
+  # the hop from there to this Ingress is plain HTTP. Redirecting to https here
+  # would bounce that hop straight back to the terminator, which re-requests
+  # over HTTP: an infinite redirect loop (Cloudflare error 1000-series /
+  # ERR_TOO_MANY_REDIRECTS). So the redirect must be switched off in this mode,
+  # not merely left unset — ingress-nginx defaults ssl-redirect to true as soon
+  # as a certificate is present anywhere in the class.
+  edge_annotations = var.tls_mode == "edge" && local.nginx ? merge(
+    {
+      "nginx.ingress.kubernetes.io/ssl-redirect"       = "false"
+      "nginx.ingress.kubernetes.io/force-ssl-redirect" = "false"
+    },
+    length(var.edge_source_ranges) > 0 ? {
+      # Without this the origin is reachable over plain HTTP by anything that
+      # can route to the Ingress, bypassing the edge entirely.
+      "nginx.ingress.kubernetes.io/whitelist-source-range" = join(",", var.edge_source_ranges)
+    } : {},
+  ) : {}
 }
 
 resource "kubernetes_namespace" "beholdr" {
@@ -119,6 +151,92 @@ resource "kubernetes_deployment" "beholdr" {
             name  = "BEHOLDR_CORS_ORIGINS"
             value = join(",", var.cors_origins)
           }
+          env {
+            name  = "BEHOLDR_PROMETHEUS_URL"
+            value = var.prometheus_url
+          }
+          dynamic "env" {
+            for_each = local.ca_file.prometheus != "" ? [1] : []
+            content {
+              name  = "BEHOLDR_PROMETHEUS_CA_FILE"
+              value = local.ca_file.prometheus
+            }
+          }
+          env {
+            name  = "BEHOLDR_PROMETHEUS_TLS_INSECURE"
+            value = tostring(var.prometheus_tls_insecure)
+          }
+          dynamic "env" {
+            for_each = var.prometheus_bearer_token_secret_name != "" ? [1] : []
+            content {
+              name = "BEHOLDR_PROMETHEUS_BEARER_TOKEN"
+              value_from {
+                secret_key_ref {
+                  name = var.prometheus_bearer_token_secret_name
+                  key  = var.prometheus_bearer_token_secret_key
+                }
+              }
+            }
+          }
+          env {
+            name  = "BEHOLDR_ELASTICSEARCH_URL"
+            value = var.elasticsearch_url
+          }
+          dynamic "env" {
+            for_each = local.ca_file.elasticsearch != "" ? [1] : []
+            content {
+              name  = "BEHOLDR_ELASTICSEARCH_CA_FILE"
+              value = local.ca_file.elasticsearch
+            }
+          }
+          env {
+            name  = "BEHOLDR_ELASTICSEARCH_TLS_INSECURE"
+            value = tostring(var.elasticsearch_tls_insecure)
+          }
+          dynamic "env" {
+            for_each = var.elasticsearch_api_key_secret_name != "" ? [1] : []
+            content {
+              name = "BEHOLDR_ELASTICSEARCH_API_KEY"
+              value_from {
+                secret_key_ref {
+                  name = var.elasticsearch_api_key_secret_name
+                  key  = var.elasticsearch_api_key_secret_key
+                }
+              }
+            }
+          }
+          env {
+            name  = "BEHOLDR_OTEL_COLLECTOR_HEALTH_URL"
+            value = var.otel_collector_health_url
+          }
+          dynamic "env" {
+            for_each = local.ca_file.otel != "" ? [1] : []
+            content {
+              name  = "BEHOLDR_OTEL_COLLECTOR_CA_FILE"
+              value = local.ca_file.otel
+            }
+          }
+          env {
+            name  = "BEHOLDR_OTEL_COLLECTOR_TLS_INSECURE"
+            value = tostring(var.otel_collector_tls_insecure)
+          }
+          env {
+            name  = "BEHOLDR_INTEGRATION_CHECK_INTERVAL"
+            value = tostring(var.integration_check_interval_seconds)
+          }
+          env {
+            name  = "BEHOLDR_INTEGRATION_REQUEST_TIMEOUT"
+            value = tostring(var.integration_request_timeout_seconds)
+          }
+
+          dynamic "volume_mount" {
+            for_each = local.ca_mounted ? [1] : []
+            content {
+              name       = "integration-ca"
+              mount_path = local.ca_mount_path
+              read_only  = true
+            }
+          }
 
           resources {
             requests = { cpu = "50m", memory = "128Mi" }
@@ -147,7 +265,29 @@ resource "kubernetes_deployment" "beholdr" {
             period_seconds        = 10
           }
         }
+
+        dynamic "volume" {
+          for_each = local.ca_mounted ? [1] : []
+          content {
+            name = "integration-ca"
+            secret {
+              secret_name  = var.integration_ca_secret_name
+              default_mode = "0444"
+            }
+          }
+        }
       }
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.integration_request_timeout_seconds <= var.integration_check_interval_seconds
+      error_message = "integration_request_timeout_seconds must not exceed integration_check_interval_seconds, or a slow backend is still in flight when the next check falls due."
+    }
+    precondition {
+      condition     = local.ca_mounted || (var.prometheus_ca_secret_key == "" && var.elasticsearch_ca_secret_key == "" && var.otel_collector_ca_secret_key == "")
+      error_message = "A *_ca_secret_key was set without integration_ca_secret_name, so no CA bundle would be mounted and the key would be silently ignored. Set integration_ca_secret_name to the Secret holding those bundles."
     }
   }
 }
@@ -171,16 +311,20 @@ resource "kubernetes_service" "beholdr" {
 resource "kubernetes_ingress_v1" "beholdr" {
   count = var.ingress_enabled ? 1 : 0
   metadata {
-    name        = local.name
-    namespace   = kubernetes_namespace.beholdr.metadata[0].name
-    labels      = local.labels
-    annotations = merge(var.ingress_annotations, var.auth_annotations)
+    name      = local.name
+    namespace = kubernetes_namespace.beholdr.metadata[0].name
+    labels    = local.labels
+    # Mode defaults first so an operator's own annotations still win.
+    annotations = merge(local.edge_annotations, var.ingress_annotations, var.auth_annotations)
   }
   spec {
     ingress_class_name = var.ingress_class
 
+    # Edge mode deliberately emits no tls block: the certificate lives at the
+    # terminator (Cloudflare, an external LB, a mesh gateway), so the cluster
+    # needs no key material of its own.
     dynamic "tls" {
-      for_each = var.tls_secret_name != "" ? [1] : []
+      for_each = var.tls_mode == "cluster" && var.tls_secret_name != "" ? [1] : []
       content {
         hosts       = [var.ingress_host]
         secret_name = var.tls_secret_name
@@ -206,8 +350,16 @@ resource "kubernetes_ingress_v1" "beholdr" {
 
   lifecycle {
     precondition {
-      condition     = var.tls_secret_name != "" || var.insecure_http
-      error_message = "Beholdr exposes cluster topology, pod names, and resource usage; the Ingress must use TLS. Set tls_secret_name (e.g. a cert-manager-issued secret) or explicitly set insecure_http = true to override for a non-production environment."
+      condition     = var.tls_mode != "cluster" || var.tls_secret_name != "" || var.insecure_http
+      error_message = "Beholdr exposes cluster topology, pod names, and resource usage; the Ingress must use TLS. Set tls_secret_name (e.g. a cert-manager-issued secret), or set tls_mode = \"edge\" if TLS is terminated in front of the cluster (Cloudflare, an external load balancer), or explicitly set insecure_http = true to override for a non-production environment."
+    }
+    precondition {
+      condition     = var.tls_mode != "edge" || trimspace(var.edge_tls_terminator) != ""
+      error_message = "tls_mode = \"edge\" hands responsibility for TLS to something outside this module, so it must be named: set edge_tls_terminator (e.g. \"cloudflare\") to record what terminates it. That name is the audit trail for why this Ingress has no certificate."
+    }
+    precondition {
+      condition     = var.tls_mode != "edge" || var.tls_secret_name == ""
+      error_message = "tls_mode = \"edge\" means the certificate lives at the terminator, so tls_secret_name is ignored and must be empty. If the edge should instead speak HTTPS to this origin (Cloudflare Full (strict) with a Cloudflare Origin CA certificate), keep tls_mode = \"cluster\" and put that certificate in tls_secret_name."
     }
     precondition {
       condition     = length(var.auth_annotations) > 0 || var.insecure_no_auth

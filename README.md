@@ -1,10 +1,12 @@
 # Beholdr
 
-A hyper-lightweight Kubernetes observer. One tiny static Go binary (with the UI
-embedded) gives you a click-and-deploy dashboard for cluster history, node and
-pod performance, pods-per-node, and per-microservice scaling/autoscaling — no
-PromQL, no external time-series database. The Go collector does all the
-aggregation; the SvelteKit UI just renders it.
+A lightweight Kubernetes observability control plane. One tiny static Go binary
+(with the UI embedded) gives you a click-and-deploy dashboard for cluster
+history, node and pod performance, pods-per-node, and per-microservice
+scaling/autoscaling. Optional integrations discover the health of Prometheus,
+Elasticsearch, and an OpenTelemetry Collector without copying telemetry into
+Beholdr. The Go collector does the Kubernetes aggregation; the SvelteKit UI just
+renders it.
 
 ## Stack
 
@@ -27,6 +29,10 @@ aggregation; the SvelteKit UI just renders it.
 - **Microservices** — every workload (Deployments, plus StatefulSets/DaemonSets)
   with replica counts, HPA range/target, summed CPU/mem, request utilization,
   node spread and restarts. Drill in for scaling history and the pod list.
+- **Observability** — connection state for the Prometheus metrics source,
+  Elasticsearch logs/traces source, and OpenTelemetry ingestion gateway,
+  including whether each one calls itself healthy and whether its certificate
+  is actually being verified.
 
 > Prerequisite: **metrics-server** must be installed for live CPU/memory. Without
 > it, topology and replica data still work but usage reads 0 (the UI shows a banner).
@@ -51,6 +57,7 @@ deploy/k8s/             plain-manifest equivalent
 GET /live                                 liveness: process can serve HTTP (no cluster dependency)
 GET /ready                                readiness: 200 once a recent collection has succeeded, 503 otherwise
 GET /api/health                           rich status for the UI (always 200): ready, last_success, last_error, metrics_available
+GET /api/integrations                     configured/reachable state for external telemetry systems
 GET /api/cluster                          cluster totals + history
 GET /api/nodes                            all nodes
 GET /api/nodes/{name}                     node detail + pods + history
@@ -75,16 +82,29 @@ might be stale.
 | `BEHOLDR_KUBE_MODE` | `auto` | `auto` \| `in-cluster` \| `kubeconfig` |
 | `KUBECONFIG` | *(default)* | kubeconfig path when not in-cluster |
 | `BEHOLDR_CORS_ORIGINS` | *(empty — disabled)* | Comma-separated allowlist of origins permitted to call the API cross-origin. Empty disables CORS entirely. `*` allows any origin — local development only. |
+| `BEHOLDR_PROMETHEUS_URL` | *(empty — disabled)* | Prometheus **server root**, e.g. `http://prometheus.monitoring.svc:9090` — the check calls `/-/ready` beneath it, so this is not the `/api/v1` query path |
+| `BEHOLDR_PROMETHEUS_BEARER_TOKEN` | *(empty)* | Optional bearer token; supply from a Kubernetes Secret |
+| `BEHOLDR_PROMETHEUS_CA_FILE` | *(system roots)* | PEM bundle that signs Prometheus's certificate, appended to the system trust store |
+| `BEHOLDR_PROMETHEUS_TLS_INSECURE` | `false` | Skip certificate verification. Last resort — logged at WARN, shown as unverified in the UI |
+| `BEHOLDR_ELASTICSEARCH_URL` | *(empty — disabled)* | Elasticsearch base URL — the check calls `/_cluster/health?local=true` beneath it |
+| `BEHOLDR_ELASTICSEARCH_API_KEY` | *(empty)* | Optional Elasticsearch API key; supply from a Kubernetes Secret |
+| `BEHOLDR_ELASTICSEARCH_CA_FILE` | *(system roots)* | PEM bundle that signs Elasticsearch's certificate (for ECK, the `ca.crt` in `<cluster>-es-http-certs-public`) |
+| `BEHOLDR_ELASTICSEARCH_TLS_INSECURE` | `false` | Skip certificate verification. Last resort — logged at WARN, shown as unverified in the UI |
+| `BEHOLDR_OTEL_COLLECTOR_HEALTH_URL` | *(empty — disabled)* | Full URL exposed by the Collector `health_check` extension, commonly port 13133 (requested as given, not a base) |
+| `BEHOLDR_OTEL_COLLECTOR_CA_FILE` | *(system roots)* | PEM bundle that signs the Collector's certificate |
+| `BEHOLDR_OTEL_COLLECTOR_TLS_INSECURE` | `false` | Skip certificate verification. Last resort — logged at WARN, shown as unverified in the UI |
+| `BEHOLDR_INTEGRATION_CHECK_INTERVAL` | `30` | Seconds between integration health checks |
+| `BEHOLDR_INTEGRATION_REQUEST_TIMEOUT` | `5` | Per-request integration timeout in seconds |
 
 ## Security model
 
 Beholdr has **no built-in authentication** and does not terminate TLS itself.
 Both are expected to be provided by whatever sits in front of it:
 
-- **TLS** — terminate at the Ingress (or load balancer / service mesh). The
-  Terraform module refuses to create an Ingress without a `tls_secret_name`
-  unless you explicitly set `insecure_http = true`; the plain manifest in
-  `deploy/k8s/beholdr.yaml` ships a cert-manager-annotated example.
+- **TLS** — terminated either in the cluster or in front of it; see
+  [TLS termination](#tls-termination) below. The Terraform module refuses to
+  create an Ingress that is not covered by one of those, and the plain manifest
+  in `deploy/k8s/beholdr.yaml` carries both variants.
 - **Authentication** — put an OIDC-aware auth proxy in front of the Ingress,
   e.g. [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/) fronting
   your IdP, wired up via `nginx.ingress.kubernetes.io/auth-url` /
@@ -96,6 +116,59 @@ Both are expected to be provided by whatever sits in front of it:
 
 Beholdr exposes cluster topology, pod names, and resource usage — treat it
 like any other cluster-admin-adjacent read path.
+
+Integration credentials are outbound-only configuration. Beholdr never returns
+their values or upstream response bodies through its API. Put them in Kubernetes
+Secrets and expose them to the Beholdr container with `secretKeyRef`; do not put
+credentials in endpoint URLs or Terraform state.
+
+Outbound checks never follow redirects, so a redirected health endpoint can
+never replay a token to another host, and failures are reported through a fixed
+vocabulary (`connection refused`, `DNS lookup failed`, `TLS certificate signed
+by an unknown authority — set the CA bundle`, …) that interpolates nothing from
+the endpoint, the credential, or the upstream response. The full error goes to
+the pod log.
+
+### TLS termination
+
+Beholdr never serves TLS itself. Where it is terminated is a deployment choice,
+and the Terraform module makes it explicit with `tls_mode`:
+
+| `tls_mode` | Who holds the certificate | When |
+|-----------|---------------------------|------|
+| `cluster` *(default)* | The Ingress, via `tls_secret_name` | cert-manager, your own PKI, or a **Cloudflare Origin CA** certificate for Cloudflare Full / Full (strict) |
+| `edge` | Something in front of the cluster | Cloudflare Flexible SSL, a Cloudflare Tunnel, an external load balancer — **no certificate or key exists in the cluster at all** |
+
+In `edge` mode nothing in the cluster needs a cert or key: the module emits no
+`tls` block, requests no certificate, and mounts no key material. Two things
+matter in that mode, and the module handles both:
+
+1. **The redirect must be switched off, not merely left unset.** The edge
+   already rewrites `http` to `https` for the public hostname, and then reaches
+   the origin over plain HTTP. If ingress-nginx also redirects to `https`, the
+   edge re-requests over HTTP and the two bounce off each other —
+   `ERR_TOO_MANY_REDIRECTS`. `edge` mode sets `ssl-redirect` and
+   `force-ssl-redirect` to `"false"` for you.
+2. **The origin now answers plain HTTP.** Anything that can route to the
+   Ingress bypasses the edge and whatever authentication sits there. Set
+   `edge_source_ranges` to the [Cloudflare IP ranges](https://www.cloudflare.com/ips/)
+   (or use a Cloudflare Tunnel, which exposes no origin at all).
+
+`edge` mode also requires `edge_tls_terminator` — a name like `"cloudflare"`,
+recorded in state as the reason this Ingress carries no certificate. That is
+deliberate: an Ingress without TLS should never be reachable by accident, only
+by a decision someone wrote down. `insecure_http` remains for local and
+throwaway environments, where TLS exists nowhere at all.
+
+The same distinction applies in the other direction. When a backend presents a
+certificate the system trust store does not know — an ECK-issued Elasticsearch
+cert, a Cloudflare Origin CA cert, a corporate PKI — mount its CA bundle
+(`integration_ca_secret_name` plus the per-provider `*_ca_secret_key`) rather
+than reaching for `*_tls_insecure`. Verification stays on, and each provider
+gets its own HTTP client, so one backend's trust settings never apply to
+another. If verification really must be disabled, Beholdr logs it at WARN on
+startup and the Observability page renders that provider as unverified, so the
+decision stays visible instead of ageing into the cluster.
 
 ## Local development
 
@@ -151,9 +224,12 @@ terraform apply
 Creates the namespace, a read-only ServiceAccount + ClusterRole (pods, nodes,
 deployments, HPAs, metrics), the Deployment, a Service, and a configurable
 Ingress (`ingress_class` / `ingress_host` / `ingress_annotations`). The
-Ingress requires `tls_secret_name` and `auth_annotations` — `terraform apply`
-fails with a clear error if either is missing, unless you explicitly opt out
-via `insecure_http` / `insecure_no_auth` for a non-production environment.
+Ingress requires TLS and `auth_annotations` — `terraform apply` fails with a
+clear error if either is missing. TLS is satisfied by `tls_secret_name`
+(`tls_mode = "cluster"`) or by naming what terminates it in front of the
+cluster (`tls_mode = "edge"` + `edge_tls_terminator`); authentication can be
+opted out of with `insecure_no_auth`, and TLS entirely with `insecure_http`,
+for non-production environments.
 See `terraform.tfvars.example` and [Security model](#security-model) above.
 Prefer raw manifests? See `deploy/k8s/beholdr.yaml`.
 
@@ -161,5 +237,6 @@ Prefer raw manifests? See `deploy/k8s/beholdr.yaml`.
 
 History is in-memory, so it resets on pod restart and isn't shared across
 replicas — run a single replica (the default). If you later want durable,
-long-range history or alerting, the same collector could write to a TSDB; the
-current design deliberately trades that away for a zero-dependency single binary.
+long-range history or alerting, configure external telemetry systems. The
+current integration slice checks backend connectivity only; querying and
+correlating their telemetry will be added behind the same provider boundary.

@@ -9,21 +9,23 @@ import (
 	"strings"
 
 	"github.com/delangetimm/beholdr/internal/collect"
+	"github.com/delangetimm/beholdr/internal/integrations"
 	"github.com/delangetimm/beholdr/internal/webui"
 )
 
 type Server struct {
-	col         *collect.Collector
-	log         *slog.Logger
-	corsOrigins []string
+	col          *collect.Collector
+	integrations *integrations.Monitor
+	log          *slog.Logger
+	corsOrigins  []string
 }
 
 // NewServer builds the API server. corsOrigins is an explicit allowlist of
 // origins permitted to make cross-origin requests; nil/empty disables CORS
 // entirely (the default). "*" may be included to allow any origin, which is
 // only appropriate for local development.
-func NewServer(col *collect.Collector, corsOrigins []string, log *slog.Logger) *Server {
-	return &Server{col: col, log: log, corsOrigins: corsOrigins}
+func NewServer(col *collect.Collector, integrations *integrations.Monitor, corsOrigins []string, log *slog.Logger) *Server {
+	return &Server{col: col, integrations: integrations, log: log, corsOrigins: corsOrigins}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -40,6 +42,7 @@ func (s *Server) Handler() http.Handler {
 	// render last-success/last-error without treating "not ready yet" as a
 	// network failure.
 	mux.HandleFunc("GET /api/health", s.health)
+	mux.HandleFunc("GET /api/integrations", s.integrationStatus)
 	mux.HandleFunc("GET /api/cluster", s.cluster)
 	mux.HandleFunc("GET /api/nodes", s.nodes)
 	mux.HandleFunc("GET /api/nodes/{name}", s.nodeDetail)
@@ -48,6 +51,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/pods", s.pods)
 	mux.Handle("/", s.spa())
 	return s.middleware(mux)
+}
+
+func (s *Server) integrationStatus(w http.ResponseWriter, r *http.Request) {
+	if s.integrations == nil {
+		writeJSON(w, http.StatusOK, integrations.Snapshot{Providers: []integrations.ProviderStatus{}})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.integrations.Snapshot())
 }
 
 func (s *Server) middleware(next http.Handler) http.Handler {
