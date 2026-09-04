@@ -1,0 +1,20 @@
+<!doctype html>
+<!--
+  Placeholder so `go build` and `go:embed all:dist` succeed without a
+  SvelteKit build having run first (e.g. `go build ./...`, `go vet ./...`,
+  editor tooling). The real build output replaces this directory's contents
+  in the Docker image; see Dockerfile stage "ui" and "build".
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Beholdr</title>
+  </head>
+  <body>
+    <p>
+      Beholdr UI was not built into this binary. Run
+      <code>cd web && npm ci && npm run build</code> and rebuild, or use the
+      published container image.
+    </p>
+  </body>
+</html>

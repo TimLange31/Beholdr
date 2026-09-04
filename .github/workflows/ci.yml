@@ -1,0 +1,87 @@
+name: CI
+
+# Quality gate for every pull request: backend build/vet/format/test,
+# frontend type-check/build, and a container build — all using the committed
+# go.sum / package-lock.json so CI resolves the exact same dependency graph
+# a local build would.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Format check
+        run: |
+          fmt_out="$(gofmt -l .)"
+          if [ -n "$fmt_out" ]; then
+            echo "gofmt needs to be run on:"
+            echo "$fmt_out"
+            exit 1
+          fi
+
+      - name: Test
+        run: go test ./... -race -cover
+
+  frontend:
+    name: Frontend (SvelteKit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install (deterministic)
+        run: npm ci
+
+      - name: Type check
+        run: npm run check
+
+      - name: Build
+        run: npm run build
+
+  container:
+    name: Container build
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
