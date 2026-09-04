@@ -1,10 +1,12 @@
 # Beholdr
 
-A hyper-lightweight Kubernetes observer. One tiny static Go binary (with the UI
-embedded) gives you a click-and-deploy dashboard for cluster history, node and
-pod performance, pods-per-node, and per-microservice scaling/autoscaling — no
-PromQL, no external time-series database. The Go collector does all the
-aggregation; the SvelteKit UI just renders it.
+A lightweight Kubernetes observability control plane. One tiny static Go binary
+(with the UI embedded) gives you a click-and-deploy dashboard for cluster
+history, node and pod performance, pods-per-node, and per-microservice
+scaling/autoscaling. Optional integrations discover the health of Prometheus,
+Elasticsearch, and an OpenTelemetry Collector without copying telemetry into
+Beholdr. The Go collector does the Kubernetes aggregation; the SvelteKit UI just
+renders it.
 
 ## Stack
 
@@ -27,6 +29,8 @@ aggregation; the SvelteKit UI just renders it.
 - **Microservices** — every workload (Deployments, plus StatefulSets/DaemonSets)
   with replica counts, HPA range/target, summed CPU/mem, request utilization,
   node spread and restarts. Drill in for scaling history and the pod list.
+- **Observability** — connection state for the Prometheus metrics source,
+  Elasticsearch logs/traces source, and OpenTelemetry ingestion gateway.
 
 > Prerequisite: **metrics-server** must be installed for live CPU/memory. Without
 > it, topology and replica data still work but usage reads 0 (the UI shows a banner).
@@ -51,6 +55,7 @@ deploy/k8s/             plain-manifest equivalent
 GET /live                                 liveness: process can serve HTTP (no cluster dependency)
 GET /ready                                readiness: 200 once a recent collection has succeeded, 503 otherwise
 GET /api/health                           rich status for the UI (always 200): ready, last_success, last_error, metrics_available
+GET /api/integrations                     configured/reachable state for external telemetry systems
 GET /api/cluster                          cluster totals + history
 GET /api/nodes                            all nodes
 GET /api/nodes/{name}                     node detail + pods + history
@@ -75,6 +80,13 @@ might be stale.
 | `BEHOLDR_KUBE_MODE` | `auto` | `auto` \| `in-cluster` \| `kubeconfig` |
 | `KUBECONFIG` | *(default)* | kubeconfig path when not in-cluster |
 | `BEHOLDR_CORS_ORIGINS` | *(empty — disabled)* | Comma-separated allowlist of origins permitted to call the API cross-origin. Empty disables CORS entirely. `*` allows any origin — local development only. |
+| `BEHOLDR_PROMETHEUS_URL` | *(empty — disabled)* | Prometheus-compatible API base URL |
+| `BEHOLDR_PROMETHEUS_BEARER_TOKEN` | *(empty)* | Optional bearer token; supply from a Kubernetes Secret |
+| `BEHOLDR_ELASTICSEARCH_URL` | *(empty — disabled)* | Elasticsearch API base URL |
+| `BEHOLDR_ELASTICSEARCH_API_KEY` | *(empty)* | Optional Elasticsearch API key; supply from a Kubernetes Secret |
+| `BEHOLDR_OTEL_COLLECTOR_HEALTH_URL` | *(empty — disabled)* | URL exposed by the Collector `health_check` extension, commonly port 13133 |
+| `BEHOLDR_INTEGRATION_CHECK_INTERVAL` | `30` | Seconds between integration health checks |
+| `BEHOLDR_INTEGRATION_REQUEST_TIMEOUT` | `5` | Per-request integration timeout in seconds |
 
 ## Security model
 
@@ -96,6 +108,11 @@ Both are expected to be provided by whatever sits in front of it:
 
 Beholdr exposes cluster topology, pod names, and resource usage — treat it
 like any other cluster-admin-adjacent read path.
+
+Integration credentials are outbound-only configuration. Beholdr never returns
+their values or upstream response bodies through its API. Put them in Kubernetes
+Secrets and expose them to the Beholdr container with `secretKeyRef`; do not put
+credentials in endpoint URLs or Terraform state.
 
 ## Local development
 
@@ -161,5 +178,6 @@ Prefer raw manifests? See `deploy/k8s/beholdr.yaml`.
 
 History is in-memory, so it resets on pod restart and isn't shared across
 replicas — run a single replica (the default). If you later want durable,
-long-range history or alerting, the same collector could write to a TSDB; the
-current design deliberately trades that away for a zero-dependency single binary.
+long-range history or alerting, configure external telemetry systems. The
+current integration slice checks backend connectivity only; querying and
+correlating their telemetry will be added behind the same provider boundary.

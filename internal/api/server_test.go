@@ -49,7 +49,7 @@ func newTestServer(t *testing.T, corsOrigins []string, collected bool, srcErr er
 		cancel()
 		col.Run(ctx)
 	}
-	return NewServer(col, corsOrigins, testLogger())
+	return NewServer(col, nil, corsOrigins, testLogger())
 }
 
 func do(s *Server, method, path, origin string) *httptest.ResponseRecorder {
@@ -107,6 +107,23 @@ func TestHealthAlways200AndReportsError(t *testing.T) {
 	}
 	if errMsg, _ := body["last_error"].(string); errMsg == "" {
 		t.Error("want last_error to be surfaced in the health payload")
+	}
+}
+
+func TestIntegrationsAvailableBeforeClusterCollection(t *testing.T) {
+	s := newTestServer(t, nil, false, nil)
+	w := do(s, http.MethodGet, "/api/integrations", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200 before the Kubernetes collector is ready, got %d", w.Code)
+	}
+	var body struct {
+		Providers []any `json:"providers"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Providers == nil {
+		t.Fatal("providers must be an empty array, not null")
 	}
 }
 

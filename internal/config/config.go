@@ -9,14 +9,21 @@ import (
 )
 
 type Config struct {
-	Addr          string        // listen address
-	PollInterval  time.Duration // how often to poll the cluster
-	HistorySize   int           // samples retained per series
-	Namespaces    []string      // restrict monitoring; empty = all
-	KubeMode      string        // "auto" | "in-cluster" | "kubeconfig"
-	Kubeconfig    string        // path when KubeMode != in-cluster
-	CORSOrigins   []string      // explicit CORS allowlist; empty = CORS disabled (the default)
-	RequestTimout time.Duration // per-call timeout to the API server
+	Addr                      string        // listen address
+	PollInterval              time.Duration // how often to poll the cluster
+	HistorySize               int           // samples retained per series
+	Namespaces                []string      // restrict monitoring; empty = all
+	KubeMode                  string        // "auto" | "in-cluster" | "kubeconfig"
+	Kubeconfig                string        // path when KubeMode != in-cluster
+	CORSOrigins               []string      // explicit CORS allowlist; empty = CORS disabled (the default)
+	RequestTimout             time.Duration // per-call timeout to the API server
+	PrometheusURL             string        // Prometheus-compatible API base URL
+	PrometheusBearerToken     string        // optional bearer token; never exposed through the API
+	ElasticsearchURL          string        // Elasticsearch API base URL
+	ElasticsearchAPIKey       string        // optional API key; never exposed through the API
+	OTelCollectorHealthURL    string        // Collector health_check extension URL
+	IntegrationCheckInterval  time.Duration // how often external systems are checked
+	IntegrationRequestTimeout time.Duration // per-call timeout for external systems
 }
 
 func Load() Config {
@@ -30,8 +37,15 @@ func Load() Config {
 		// No default origins: Beholdr exposes cluster topology, pod names,
 		// and resource usage, so cross-origin access must be opted into
 		// explicitly. Set to "*" only for local development.
-		CORSOrigins:   splitCSV(env("BEHOLDR_CORS_ORIGINS", "")),
-		RequestTimout: time.Duration(envInt("BEHOLDR_REQUEST_TIMEOUT", 10)) * time.Second,
+		CORSOrigins:               splitCSV(env("BEHOLDR_CORS_ORIGINS", "")),
+		RequestTimout:             time.Duration(envInt("BEHOLDR_REQUEST_TIMEOUT", 10)) * time.Second,
+		PrometheusURL:             env("BEHOLDR_PROMETHEUS_URL", ""),
+		PrometheusBearerToken:     env("BEHOLDR_PROMETHEUS_BEARER_TOKEN", ""),
+		ElasticsearchURL:          env("BEHOLDR_ELASTICSEARCH_URL", ""),
+		ElasticsearchAPIKey:       env("BEHOLDR_ELASTICSEARCH_API_KEY", ""),
+		OTelCollectorHealthURL:    env("BEHOLDR_OTEL_COLLECTOR_HEALTH_URL", ""),
+		IntegrationCheckInterval:  time.Duration(envInt("BEHOLDR_INTEGRATION_CHECK_INTERVAL", 30)) * time.Second,
+		IntegrationRequestTimeout: time.Duration(envInt("BEHOLDR_INTEGRATION_REQUEST_TIMEOUT", 5)) * time.Second,
 	}
 }
 

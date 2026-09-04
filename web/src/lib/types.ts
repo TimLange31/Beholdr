@@ -35,3 +35,18 @@ export interface Health {
   last_error_at: number;
   metrics_available: boolean;
 }
+
+export interface IntegrationProvider {
+  name: string;
+  signal: string;
+  configured: boolean;
+  reachable: boolean;
+  checked_at: number;
+  latency_ms: number;
+  error?: string;
+}
+
+export interface IntegrationStatus {
+  updated_at: number;
+  providers: IntegrationProvider[];
+}

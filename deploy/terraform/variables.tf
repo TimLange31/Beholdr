@@ -86,3 +86,57 @@ variable "cors_origins" {
   type        = list(string)
   default     = []
 }
+
+variable "prometheus_url" {
+  description = "Prometheus-compatible API base URL. Empty disables the integration."
+  type        = string
+  default     = ""
+}
+
+variable "prometheus_bearer_token_secret_name" {
+  description = "Existing Kubernetes Secret containing the optional Prometheus bearer token. Empty omits the token."
+  type        = string
+  default     = ""
+}
+
+variable "prometheus_bearer_token_secret_key" {
+  description = "Key in prometheus_bearer_token_secret_name."
+  type        = string
+  default     = "token"
+}
+
+variable "elasticsearch_url" {
+  description = "Elasticsearch API base URL. Empty disables the integration."
+  type        = string
+  default     = ""
+}
+
+variable "elasticsearch_api_key_secret_name" {
+  description = "Existing Kubernetes Secret containing the optional Elasticsearch API key. Empty omits the key."
+  type        = string
+  default     = ""
+}
+
+variable "elasticsearch_api_key_secret_key" {
+  description = "Key in elasticsearch_api_key_secret_name."
+  type        = string
+  default     = "api-key"
+}
+
+variable "otel_collector_health_url" {
+  description = "OpenTelemetry Collector health_check extension URL. Empty disables the integration."
+  type        = string
+  default     = ""
+}
+
+variable "integration_check_interval_seconds" {
+  description = "How often Beholdr checks external telemetry systems."
+  type        = number
+  default     = 30
+}
+
+variable "integration_request_timeout_seconds" {
+  description = "Per-request timeout for external telemetry system health checks."
+  type        = number
+  default     = 5
+}

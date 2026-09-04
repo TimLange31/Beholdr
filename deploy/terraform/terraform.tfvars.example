@@ -25,3 +25,11 @@ auth_annotations = {
 # Only set this if a separately-hosted frontend needs to call the API
 # cross-origin. Empty (the default) disables CORS entirely.
 # cors_origins = ["https://dashboard.example.com"]
+
+# External telemetry integrations. Credentials reference existing Kubernetes
+# Secrets and are never placed in Terraform variables/state.
+# prometheus_url                      = "http://prometheus.monitoring.svc.cluster.local:9090"
+# prometheus_bearer_token_secret_name = "beholdr-prometheus"
+# elasticsearch_url                   = "https://example.es.europe-west1.gcp.cloud.es.io"
+# elasticsearch_api_key_secret_name   = "beholdr-elasticsearch"
+# otel_collector_health_url           = "http://beholdr-otel-collector.beholdr.svc.cluster.local:13133/"

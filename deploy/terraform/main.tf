@@ -119,6 +119,50 @@ resource "kubernetes_deployment" "beholdr" {
             name  = "BEHOLDR_CORS_ORIGINS"
             value = join(",", var.cors_origins)
           }
+          env {
+            name  = "BEHOLDR_PROMETHEUS_URL"
+            value = var.prometheus_url
+          }
+          dynamic "env" {
+            for_each = var.prometheus_bearer_token_secret_name != "" ? [1] : []
+            content {
+              name = "BEHOLDR_PROMETHEUS_BEARER_TOKEN"
+              value_from {
+                secret_key_ref {
+                  name = var.prometheus_bearer_token_secret_name
+                  key  = var.prometheus_bearer_token_secret_key
+                }
+              }
+            }
+          }
+          env {
+            name  = "BEHOLDR_ELASTICSEARCH_URL"
+            value = var.elasticsearch_url
+          }
+          dynamic "env" {
+            for_each = var.elasticsearch_api_key_secret_name != "" ? [1] : []
+            content {
+              name = "BEHOLDR_ELASTICSEARCH_API_KEY"
+              value_from {
+                secret_key_ref {
+                  name = var.elasticsearch_api_key_secret_name
+                  key  = var.elasticsearch_api_key_secret_key
+                }
+              }
+            }
+          }
+          env {
+            name  = "BEHOLDR_OTEL_COLLECTOR_HEALTH_URL"
+            value = var.otel_collector_health_url
+          }
+          env {
+            name  = "BEHOLDR_INTEGRATION_CHECK_INTERVAL"
+            value = tostring(var.integration_check_interval_seconds)
+          }
+          env {
+            name  = "BEHOLDR_INTEGRATION_REQUEST_TIMEOUT"
+            value = tostring(var.integration_request_timeout_seconds)
+          }
 
           resources {
             requests = { cpu = "50m", memory = "128Mi" }

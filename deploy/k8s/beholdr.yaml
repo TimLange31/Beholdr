@@ -72,6 +72,16 @@ spec:
             # explicitly. Leave unset unless a separately-hosted frontend
             # needs to call this API cross-origin.
             - { name: BEHOLDR_CORS_ORIGINS, value: "" }
+            # External systems are optional. Empty endpoints keep each
+            # integration disabled until its platform component exists.
+            - { name: BEHOLDR_PROMETHEUS_URL, value: "" }
+            - { name: BEHOLDR_ELASTICSEARCH_URL, value: "" }
+            - { name: BEHOLDR_OTEL_COLLECTOR_HEALTH_URL, value: "" }
+            - { name: BEHOLDR_INTEGRATION_CHECK_INTERVAL, value: "30" }
+            - { name: BEHOLDR_INTEGRATION_REQUEST_TIMEOUT, value: "5" }
+            # Add BEHOLDR_PROMETHEUS_BEARER_TOKEN and
+            # BEHOLDR_ELASTICSEARCH_API_KEY with secretKeyRef entries when
+            # authentication is required. Never put credentials in these URLs.
           resources:
             requests: { cpu: "50m", memory: "128Mi" }
             limits: { cpu: "500m", memory: "512Mi" }
