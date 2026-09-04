@@ -1,0 +1,3516 @@
+From 379d39c94ff620b2b2f174726d96a9b8c917384e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 4 Sep 2026 21:02:11 +0000
+Subject: [PATCH] Fix service-health correctness, configurability and query
+ safety
+
+Follow-up to #3. The feature was sound in shape but could not be used
+outside one metric profile, and several signals could report a confident
+wrong severity.
+
+Configurability
+- Wire servicehealth.Config through env vars, Terraform and the raw
+  manifest. It was previously constructed as a zero value, so the
+  metric names, label names and all ten thresholds were unreachable and
+  every deployment was pinned to the ASP.NET Core defaults.
+- Reject configuration that is set but unusable (malformed identifier,
+  critical <= warning, unparseable number) at startup instead of
+  silently substituting a default. The old thresholdsOr could invert a
+  pair: warning 10 / critical 8 became warning 10 / critical 5.
+
+Query safety
+- Give range and instant queries their own client and timeout
+  (BEHOLDR_PROMETHEUS_QUERY_TIMEOUT, default 30s). They previously
+  inherited the 5s connectivity-check client, which a multi-week range
+  query will routinely exceed.
+- Select the Prometheus provider by name rather than providers[0].
+  Reordering that slice would have sent the Elasticsearch API key to
+  Prometheus's query API.
+- Cache reports per (workload, window), collapse concurrent identical
+  requests into one evaluation, and bound in-flight queries. The UI
+  polls per open tab and Beholdr has no auth of its own.
+- Drop the response cap from 16 MiB to 2 MiB; several queries buffer
+  concurrently against a 512Mi limit.
+- Classify Prometheus's documented errorType enum into an actionable
+  closed vocabulary instead of one generic "query failed".
+
+Correctness
+- Score severity from an instant query, not the last range point. The
+  old behaviour made severity depend on the selected chart window: at a
+  1h step a spike from the last ten minutes was invisible on the 21d
+  view.
+- Pin scoring to the workload's live pod names. "^name(-.+)?$", used for
+  every non-Deployment workload, matched sibling services' pods.
+  Charts keep a tightened name-shape selector for rollout history.
+- Score CPU against limits by default, configurable to requests.
+  Requests are a scheduling floor; 80/95 against them marks healthy
+  bursty services critical forever.
+- Distinguish "metric absent for this workload" from "query failed".
+  A service with no memory limit no longer reads as unknown forever,
+  while a failed query still cannot make a service look green.
+- Suppress the week-before overlay past 7d, where offset 1w overlaps
+  the current series instead of comparing against it.
+- Exclude Job pods from the failing-pod count; a Pod that failed weeks
+  ago reports phase="Failed" for as long as the object exists.
+- Error on unexpected extra series instead of scoring series[0].
+- Omit the warning threshold for single-replica workloads, where it was
+  equal to critical.
+
+UI and docs
+- Drive formatting from the API's unit and state fields rather than a
+  second switch on the signal key.
+- Document the metric profile, thresholds, kube-state-metrics
+  dependency and the pod-selection limitation.
+- Add .gitattributes; the repository currently rewrites every line on a
+  Windows checkout. Run `git add --renormalize .` once after applying.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QswAjptFrWYwpjGFa6ZUKB
+---
+ .gitattributes                                |  14 +
+ PRODUCTION_BACKLOG.md                         |   8 +-
+ README.md                                     | 106 ++-
+ cmd/beholdr/main.go                           |  49 +-
+ deploy/k8s/beholdr.yaml                       |  40 ++
+ deploy/terraform/main.tf                      |  50 ++
+ deploy/terraform/variables.tf                 | 101 +++
+ internal/api/server.go                        |  41 +-
+ internal/api/server_test.go                   | 141 +++-
+ internal/config/config.go                     |  98 ++-
+ internal/config/config_test.go                |  62 ++
+ internal/integrations/monitor.go              |  90 ++-
+ internal/integrations/prometheus.go           | 221 ++++--
+ internal/integrations/prometheus_test.go      | 157 ++++-
+ internal/servicehealth/cache.go               | 120 ++++
+ internal/servicehealth/service.go             | 617 +++++++++++++----
+ internal/servicehealth/service_test.go        | 629 ++++++++++++++++--
+ web/src/lib/types.ts                          |  12 +-
+ .../microservices/[ns]/[name]/+page.svelte    |  39 +-
+ 19 files changed, 2277 insertions(+), 318 deletions(-)
+ create mode 100644 .gitattributes
+ create mode 100644 internal/servicehealth/cache.go
+
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..36dfe05
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,14 @@
++# Normalise line endings in the repository. Without this, a checkout on Windows
++# and one on Linux disagree on every line of every text file, which shows up as
++# a whole-repository rewrite in `git status` and makes a real diff unreviewable.
++# After adding this, run once: git add --renormalize . && git commit
++* text=auto eol=lf
++
++# Keep the shell scripts and lockfiles byte-stable too.
++*.sh    text eol=lf
++*.go    text eol=lf
++*.tf    text eol=lf
++*.yaml  text eol=lf
++*.yml   text eol=lf
++*.json  text eol=lf
++*.svelte text eol=lf
+diff --git a/PRODUCTION_BACKLOG.md b/PRODUCTION_BACKLOG.md
+index 0bcab76..1c21211 100644
+--- a/PRODUCTION_BACKLOG.md
++++ b/PRODUCTION_BACKLOG.md
+@@ -27,8 +27,12 @@ production-ready release; **P2** is planned follow-up.
+   container-build quality gates.
+ - [x] Read-only Prometheus, Elasticsearch, and OpenTelemetry Collector health
+   integrations with provider-scoped TLS and secret-backed credentials.
+-- [x] Fixed, bounded per-service PromQL range queries and charts for HTTP error
+-  rate/week comparison, CPU, memory, and failing pods.
++- [x] Fixed, bounded per-service PromQL queries and charts for HTTP error
++  rate/week comparison, CPU, memory, and failing pods — configurable metric and
++  label profile, thresholds validated at startup, severity scored from an
++  instant query so it does not vary with the selected chart window, and reports
++  cached, de-duplicated and concurrency-bounded so the UI cannot amplify load
++  onto Prometheus.
+ 
+ ## P0 — remaining release blockers
+ 
+diff --git a/README.md b/README.md
+index cec1601..a995884 100644
+--- a/README.md
++++ b/README.md
+@@ -67,7 +67,7 @@ GET /api/nodes/{name}                     node detail + pods + history
+ GET /api/microservices                    all workloads
+ GET /api/microservices/{ns}/{name}        workload detail + pods + history
+ GET /api/microservices/{ns}/{name}/metrics?range=24h
+-                                         fixed service signals; range: 1h|6h|24h|7d|21d
++                                          fixed service signals; range: 1h|6h|24h|7d|21d
+ GET /api/pods                             all pods
+ ```
+ 
+@@ -99,7 +99,8 @@ might be stale.
+ | `BEHOLDR_OTEL_COLLECTOR_CA_FILE` | *(system roots)* | PEM bundle that signs the Collector's certificate |
+ | `BEHOLDR_OTEL_COLLECTOR_TLS_INSECURE` | `false` | Skip certificate verification. Last resort — logged at WARN, shown as unverified in the UI |
+ | `BEHOLDR_INTEGRATION_CHECK_INTERVAL` | `30` | Seconds between integration health checks |
+-| `BEHOLDR_INTEGRATION_REQUEST_TIMEOUT` | `5` | Per-request integration timeout in seconds |
++| `BEHOLDR_INTEGRATION_REQUEST_TIMEOUT` | `5` | Per-request timeout for the connectivity health checks, in seconds |
++| `BEHOLDR_PROMETHEUS_QUERY_TIMEOUT` | `30` | Per-query timeout for Prometheus range/instant queries, in seconds. See [Service health queries](#service-health-queries) for the rest of that configuration |
+ 
+ ## Security model
+ 
+@@ -138,29 +139,94 @@ the pod log.
+ 
+ Beholdr owns the PromQL templates and only exposes the five bounded windows
+ `1h`, `6h`, `24h`, `7d`, and `21d`. The browser cannot submit arbitrary PromQL.
+-Each request is limited to 2,000 evaluation points and a 16 MiB response.
++Each query is limited to 2,000 evaluation points and a 2 MiB response, several
++run per report, and reports are cached and de-duplicated (see
++`BEHOLDR_SERVICE_METRICS_CACHE_TTL` and `BEHOLDR_SERVICE_MAX_CONCURRENT_QUERIES`)
++so a page left open cannot turn into load on the Prometheus you are debugging
++with.
++
++Each signal is evaluated twice: a **range query** over the selected window draws
++the chart, and an **instant query** at *now* produces the number and the
++severity. They are deliberately separate — a range query's newest point is only
++as fresh as that range's step, so scoring from it would make a service's
++severity depend on which window happened to be selected, and a spike that
++started ten minutes ago would be invisible on the 21-day view.
+ 
+ | Signal | Calculation | Warning | Critical |
+ |--------|-------------|---------|----------|
+ | HTTP error rate | HTTP 5xx request rate / all HTTP request rate | 1% | 5% |
+-| Error-rate increase | Current rate minus the aligned `offset 1w` series | +0.5 percentage points | +2 percentage points |
+-| CPU | Container CPU usage / Kubernetes CPU requests | 80% | 95% |
++| Error-rate increase | Current rate minus the aligned `offset 1w` series (windows ≤ 7d only) | +0.5 percentage points | +2 percentage points |
++| CPU | Container CPU usage / Kubernetes CPU **limits** (see `BEHOLDR_SERVICE_CPU_BASIS`) | 80% | 95% |
+ | Memory | Container working set / Kubernetes memory limits | 80% | 95% |
+-| Failing pods | Crash/image/config waiting pods plus Failed/Unknown pods | ≥10% (minimum 1) | ≥25% (minimum 2; 1 for a single-replica service) |
+-
+-These thresholds currently produce health states in the API and UI; they do
+-not send notifications yet. Missing metrics produce `unknown`, never a green
+-status. The default ASP.NET Core metric profile uses
+-`aspnetcore_requests_duration_seconds_count` with `code=~"5.."`, divided by
+-the same request counter without the status filter and scoped by
+-`kubernetes_namespace` and `app_kubernetes_io_name`. Kubernetes signals use
+-cAdvisor/kube-state-metrics with their separate `namespace` and `pod` labels.
+-Deployment infrastructure series are selected by their stable pod-name pattern
+-so historical pods remain visible across rollouts.
+-
+-A complete week-before overlay across the full 21-day window requires 28 days
+-of Prometheus retention. With exactly 21 days retained, the current series is
+-complete but the comparison series is absent for the earliest seven days.
++| Failing pods | Crash/image/config waiting pods plus Failed/Unknown pods, excluding Job pods | ≥10% (minimum 1) | ≥25% (minimum 2; 1 and no warning band for a single-replica service) |
++
++These thresholds produce health states in the API and UI; they do not send
++notifications. Each signal reports a `state` alongside its severity:
++
++- `ok` — measured.
++- `no_data` — the metric does not exist for this workload (no memory limit
++  configured, no HTTP traffic). Skipped in the service's aggregate state: a
++  service without a memory limit is not thereby in an unknown condition.
++- `error` — the query itself failed. Counts as `unknown` in the aggregate, so a
++  broken query can never make a service look green.
++
++**CPU is scored against limits, not requests.** Requests are a scheduling
++floor rather than a ceiling, and a healthy bursty service routinely runs at
++several hundred percent of its request, so thresholds of 80/95 against requests
++would mark it critical forever. Set `BEHOLDR_SERVICE_CPU_BASIS=requests` if you
++prefer that view, and raise the CPU thresholds to match.
++
++**The week-before overlay is only drawn on windows up to 7d.** Past a week the
++`offset 1w` series overlaps the current one — the same wall-clock samples drawn
++twice — so it is suppressed rather than presented as a comparison. Where it is
++drawn, a complete overlay needs the window plus seven days of Prometheus
++retention.
++
++**Which pods a signal covers.** Scoring pins itself to the pod names the
++collector currently sees for the workload, so a badge can never be raised by
++another service's pods. The charts select by pod-name shape instead, so pods
++replaced by earlier rollouts stay in the history; that shape cannot always
++separate a workload named `api` from one named `api-gateway`, which is why the
++score does not rely on it.
++
++### Metric profile
++
++Beholdr's defaults describe an ASP.NET Core application scraped with
++`kubernetes_namespace` / `app_kubernetes_io_name` labels, plus
++cAdvisor/kube-state-metrics for the Kubernetes signals. Every one of them is
++configurable, and a value that is set but unusable (a malformed metric name, a
++critical threshold at or below its warning) stops the process at startup rather
++than being silently replaced with something you did not choose.
++
++| Var | Default | Meaning |
++|-----|---------|---------|
++| `BEHOLDR_PROMETHEUS_QUERY_TIMEOUT` | `30` | Seconds per range/instant query. Separate from `BEHOLDR_INTEGRATION_REQUEST_TIMEOUT`, which sizes the liveness check — a multi-week range query is normal work and must not inherit it |
++| `BEHOLDR_SERVICE_METRICS_CACHE_TTL` | `30` | Seconds a completed report is reused. Concurrent requests for the same workload and window always share one evaluation |
++| `BEHOLDR_SERVICE_MAX_CONCURRENT_QUERIES` | `6` | Upper bound on Prometheus queries in flight from this pod |
++| `BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC` | `aspnetcore_requests_duration_seconds_count` | Counter of handled HTTP requests. For OpenTelemetry conventions: `http_server_request_duration_seconds_count` |
++| `BEHOLDR_SERVICE_HTTP_ERRORS_METRIC` | *(empty)* | Optional separate failure counter. Empty means errors come from the requests metric filtered by the status label |
++| `BEHOLDR_SERVICE_HTTP_STATUS_LABEL` | `code` | Response-status label. For OpenTelemetry conventions: `http_response_status_code` |
++| `BEHOLDR_SERVICE_APP_NAMESPACE_LABEL` | `kubernetes_namespace` | Namespace label on your application metrics |
++| `BEHOLDR_SERVICE_APP_SERVICE_LABEL` | `app_kubernetes_io_name` | Service label on your application metrics, matched against the workload name — it must carry the same value as the Deployment name, or the HTTP signals find nothing |
++| `BEHOLDR_SERVICE_APP_POD_LABEL` | `kubernetes_pod_name` | Pod label on your application metrics, used when no service label is available |
++| `BEHOLDR_SERVICE_KUBE_NAMESPACE_LABEL` | `namespace` | Namespace label on cAdvisor/kube-state-metrics series |
++| `BEHOLDR_SERVICE_KUBE_POD_LABEL` | `pod` | Pod label on cAdvisor/kube-state-metrics series |
++| `BEHOLDR_SERVICE_CPU_BASIS` | `limits` | `limits` or `requests` — what CPU usage is scored against |
++| `BEHOLDR_SERVICE_ERROR_RATE_WARNING` / `_CRITICAL` | `1` / `5` | Error-rate thresholds, in percent |
++| `BEHOLDR_SERVICE_ERROR_INCREASE_WARNING` / `_CRITICAL` | `0.5` / `2` | Week-over-week increase thresholds, in percentage points |
++| `BEHOLDR_SERVICE_CPU_WARNING` / `_CRITICAL` | `80` / `95` | CPU thresholds, in percent of the chosen basis |
++| `BEHOLDR_SERVICE_MEMORY_WARNING` / `_CRITICAL` | `80` / `95` | Memory thresholds, in percent of limits |
++| `BEHOLDR_SERVICE_FAILING_PODS_WARNING` / `_CRITICAL` | `1` / `2` | Failing-pod counts, raised to 10%/25% of desired replicas for larger workloads |
++
++The Terraform module exposes the same settings as `service_*` variables and a
++`service_thresholds` object. It refuses to apply if any of them are set without
++`prometheus_url`, since nothing would query them.
++
++The Kubernetes signals require **kube-state-metrics** and cAdvisor
++(`kube_pod_container_resource_limits`, `kube_pod_status_phase`,
++`kube_pod_container_status_waiting_reason`, `kube_pod_owner`, `kube_pod_info`,
++`container_cpu_usage_seconds_total`, `container_memory_working_set_bytes`) in
++the same Prometheus.
+ 
+ ### TLS termination
+ 
+diff --git a/cmd/beholdr/main.go b/cmd/beholdr/main.go
+index f6587f4..23f4b53 100644
+--- a/cmd/beholdr/main.go
++++ b/cmd/beholdr/main.go
+@@ -16,6 +16,7 @@ import (
+ 	"github.com/delangetimm/beholdr/internal/config"
+ 	"github.com/delangetimm/beholdr/internal/integrations"
+ 	"github.com/delangetimm/beholdr/internal/k8s"
++	"github.com/delangetimm/beholdr/internal/servicehealth"
+ )
+ 
+ func main() {
+@@ -23,6 +24,10 @@ func main() {
+ 	slog.SetDefault(log)
+ 
+ 	cfg := config.Load()
++	if err := cfg.Validate(); err != nil {
++		log.Error("configuration", "err", err)
++		os.Exit(1)
++	}
+ 
+ 	client, err := k8s.New(cfg.KubeMode, cfg.Kubeconfig, cfg.Namespaces, log)
+ 	if err != nil {
+@@ -45,8 +50,18 @@ func main() {
+ 		CollectorTLS:          integrationTLS(cfg.OTelCollectorTLS),
+ 		Interval:              cfg.IntegrationCheckInterval,
+ 		Timeout:               cfg.IntegrationRequestTimeout,
++		QueryTimeout:          cfg.PrometheusQueryTimeout,
+ 	}, log)
+ 
++	// Built here rather than inside the API server so an unusable metric
++	// profile stops the process at startup, where an operator will see it,
++	// instead of turning every service-health request into a 502.
++	health, err := servicehealth.New(integrationMonitor, serviceHealthConfig(cfg.ServiceHealth))
++	if err != nil {
++		log.Error("service health configuration", "err", err)
++		os.Exit(1)
++	}
++
+ 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+ 	defer stop()
+ 
+@@ -55,7 +70,7 @@ func main() {
+ 
+ 	srv := &http.Server{
+ 		Addr:              cfg.Addr,
+-		Handler:           api.NewServer(col, integrationMonitor, cfg.CORSOrigins, log).Handler(),
++		Handler:           api.NewServer(col, integrationMonitor, health, cfg.CORSOrigins, log).Handler(),
+ 		ReadHeaderTimeout: 5 * time.Second,
+ 	}
+ 
+@@ -74,6 +89,38 @@ func main() {
+ 	_ = srv.Shutdown(shutCtx)
+ }
+ 
++// serviceHealthConfig adapts the config package's transport-agnostic settings
++// to the servicehealth package, keeping config free of any dependency on it.
++// Empty and zero fields are left alone: servicehealth owns the defaults and
++// rejects anything set but unusable.
++func serviceHealthConfig(c config.ServiceHealthConfig) servicehealth.Config {
++	return servicehealth.Config{
++		HTTPRequestsMetric: c.HTTPRequestsMetric,
++		HTTPErrorsMetric:   c.HTTPErrorsMetric,
++		HTTPStatusLabel:    c.HTTPStatusLabel,
++		AppNamespaceLabel:  c.AppNamespaceLabel,
++		AppServiceLabel:    c.AppServiceLabel,
++		AppPodLabel:        c.AppPodLabel,
++		KubeNamespaceLabel: c.KubeNamespaceLabel,
++		KubePodLabel:       c.KubePodLabel,
++		CPUBasis:           servicehealth.CPUBasis(c.CPUBasis),
++		Thresholds: servicehealth.Thresholds{
++			ErrorRateWarning:      c.ErrorRateWarning,
++			ErrorRateCritical:     c.ErrorRateCritical,
++			ErrorIncreaseWarning:  c.ErrorIncreaseWarning,
++			ErrorIncreaseCritical: c.ErrorIncreaseCritical,
++			CPUWarning:            c.CPUWarning,
++			CPUCritical:           c.CPUCritical,
++			MemoryWarning:         c.MemoryWarning,
++			MemoryCritical:        c.MemoryCritical,
++			FailingPodsWarning:    c.FailingPodsWarning,
++			FailingPodsCritical:   c.FailingPodsCritical,
++		},
++		CacheTTL:             c.CacheTTL,
++		MaxConcurrentQueries: c.MaxConcurrentQueries,
++	}
++}
++
+ // integrationTLS adapts the config package's transport-agnostic TLS settings to
+ // the integrations package, keeping config free of any dependency on it.
+ func integrationTLS(t config.TLSConfig) integrations.TLS {
+diff --git a/deploy/k8s/beholdr.yaml b/deploy/k8s/beholdr.yaml
+index d35dbfa..d1c6643 100644
+--- a/deploy/k8s/beholdr.yaml
++++ b/deploy/k8s/beholdr.yaml
+@@ -79,6 +79,46 @@ spec:
+             - { name: BEHOLDR_OTEL_COLLECTOR_HEALTH_URL, value: "" }
+             - { name: BEHOLDR_INTEGRATION_CHECK_INTERVAL, value: "30" }
+             - { name: BEHOLDR_INTEGRATION_REQUEST_TIMEOUT, value: "5" }
++            # Prometheus range/instant queries are real work, not a liveness
++            # probe, so they get their own (much longer) timeout. Reusing the
++            # 5s health-check timeout above makes the long windows fail.
++            - { name: BEHOLDR_PROMETHEUS_QUERY_TIMEOUT, value: "30" }
++            # Service-health reports are reused for this long and bounded to
++            # this many concurrent queries. The UI polls per open browser tab
++            # and each uncached report is ten or more Prometheus queries, so
++            # these are what keep a busy incident from loading the Prometheus
++            # you are debugging with.
++            - { name: BEHOLDR_SERVICE_METRICS_CACHE_TTL, value: "30" }
++            - { name: BEHOLDR_SERVICE_MAX_CONCURRENT_QUERIES, value: "6" }
++            #
++            # Service-health metric profile. Beholdr owns the PromQL; these
++            # name the metrics and labels it selects on. Leave a value unset to
++            # take Beholdr's default (shown in the comment). A value that is
++            # set but unusable stops the pod at startup rather than being
++            # silently replaced.
++            #
++            # ASP.NET Core (Beholdr's defaults):
++            # - { name: BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC, value: "aspnetcore_requests_duration_seconds_count" }
++            # - { name: BEHOLDR_SERVICE_HTTP_STATUS_LABEL, value: "code" }
++            # OpenTelemetry semantic conventions:
++            # - { name: BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC, value: "http_server_request_duration_seconds_count" }
++            # - { name: BEHOLDR_SERVICE_HTTP_STATUS_LABEL, value: "http_response_status_code" }
++            #
++            # Label names depend on your Prometheus relabeling. The app labels
++            # default to kubernetes_namespace / app_kubernetes_io_name; the
++            # cAdvisor and kube-state-metrics labels to namespace / pod.
++            # - { name: BEHOLDR_SERVICE_APP_NAMESPACE_LABEL, value: "kubernetes_namespace" }
++            # - { name: BEHOLDR_SERVICE_APP_SERVICE_LABEL, value: "app_kubernetes_io_name" }
++            # - { name: BEHOLDR_SERVICE_KUBE_NAMESPACE_LABEL, value: "namespace" }
++            # - { name: BEHOLDR_SERVICE_KUBE_POD_LABEL, value: "pod" }
++            #
++            # CPU is scored against limits by default, where over 100% means
++            # throttling. Switch to requests only with thresholds that suit it:
++            # requests are a scheduling floor, and healthy bursty services sit
++            # well above 100% of request.
++            # - { name: BEHOLDR_SERVICE_CPU_BASIS, value: "requests" }
++            # - { name: BEHOLDR_SERVICE_CPU_WARNING, value: "150" }
++            # - { name: BEHOLDR_SERVICE_CPU_CRITICAL, value: "300" }
+             # Add BEHOLDR_PROMETHEUS_BEARER_TOKEN and
+             # BEHOLDR_ELASTICSEARCH_API_KEY with secretKeyRef entries when
+             # authentication is required. Never put credentials in these URLs.
+diff --git a/deploy/terraform/main.tf b/deploy/terraform/main.tf
+index a073e22..46e8587 100644
+--- a/deploy/terraform/main.tf
++++ b/deploy/terraform/main.tf
+@@ -29,6 +29,31 @@ locals {
+ 
+   nginx = var.ingress_class == "nginx"
+ 
++  # Service-health configuration. Every entry is optional: an empty value is
++  # omitted so Beholdr applies its own default rather than being handed an
++  # empty string it would have to interpret.
++  service_health_env = {
++    BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC   = var.service_http_requests_metric
++    BEHOLDR_SERVICE_HTTP_ERRORS_METRIC     = var.service_http_errors_metric
++    BEHOLDR_SERVICE_HTTP_STATUS_LABEL      = var.service_http_status_label
++    BEHOLDR_SERVICE_APP_NAMESPACE_LABEL    = var.service_app_namespace_label
++    BEHOLDR_SERVICE_APP_SERVICE_LABEL      = var.service_app_service_label
++    BEHOLDR_SERVICE_APP_POD_LABEL          = var.service_app_pod_label
++    BEHOLDR_SERVICE_KUBE_NAMESPACE_LABEL   = var.service_kube_namespace_label
++    BEHOLDR_SERVICE_KUBE_POD_LABEL         = var.service_kube_pod_label
++    BEHOLDR_SERVICE_CPU_BASIS              = var.service_cpu_basis
++    BEHOLDR_SERVICE_ERROR_RATE_WARNING     = try(tostring(var.service_thresholds.error_rate_warning), "")
++    BEHOLDR_SERVICE_ERROR_RATE_CRITICAL    = try(tostring(var.service_thresholds.error_rate_critical), "")
++    BEHOLDR_SERVICE_ERROR_INCREASE_WARNING = try(tostring(var.service_thresholds.error_increase_warning), "")
++    BEHOLDR_SERVICE_ERROR_INCREASE_CRITICAL = try(tostring(var.service_thresholds.error_increase_critical), "")
++    BEHOLDR_SERVICE_CPU_WARNING            = try(tostring(var.service_thresholds.cpu_warning), "")
++    BEHOLDR_SERVICE_CPU_CRITICAL           = try(tostring(var.service_thresholds.cpu_critical), "")
++    BEHOLDR_SERVICE_MEMORY_WARNING         = try(tostring(var.service_thresholds.memory_warning), "")
++    BEHOLDR_SERVICE_MEMORY_CRITICAL        = try(tostring(var.service_thresholds.memory_critical), "")
++    BEHOLDR_SERVICE_FAILING_PODS_WARNING   = try(tostring(var.service_thresholds.failing_pods_warning), "")
++    BEHOLDR_SERVICE_FAILING_PODS_CRITICAL  = try(tostring(var.service_thresholds.failing_pods_critical), "")
++  }
++
+   # In edge mode the public hostname is already HTTPS-only at the terminator
+   # (Cloudflare "Always Use HTTPS"/automatic rewrites, or an external LB), and
+   # the hop from there to this Ingress is plain HTTP. Redirecting to https here
+@@ -228,6 +253,27 @@ resource "kubernetes_deployment" "beholdr" {
+             name  = "BEHOLDR_INTEGRATION_REQUEST_TIMEOUT"
+             value = tostring(var.integration_request_timeout_seconds)
+           }
++          env {
++            # Range and instant queries are real Prometheus work, not a
++            # liveness probe: they must not inherit the health-check timeout.
++            name  = "BEHOLDR_PROMETHEUS_QUERY_TIMEOUT"
++            value = tostring(var.prometheus_query_timeout_seconds)
++          }
++          env {
++            name  = "BEHOLDR_SERVICE_METRICS_CACHE_TTL"
++            value = tostring(var.service_metrics_cache_ttl_seconds)
++          }
++          env {
++            name  = "BEHOLDR_SERVICE_MAX_CONCURRENT_QUERIES"
++            value = tostring(var.service_max_concurrent_queries)
++          }
++          dynamic "env" {
++            for_each = { for name, value in local.service_health_env : name => value if value != "" }
++            content {
++              name  = env.key
++              value = env.value
++            }
++          }
+ 
+           dynamic "volume_mount" {
+             for_each = local.ca_mounted ? [1] : []
+@@ -281,6 +327,10 @@ resource "kubernetes_deployment" "beholdr" {
+   }
+ 
+   lifecycle {
++    precondition {
++      condition     = var.prometheus_url != "" || alltrue([for value in values(local.service_health_env) : value == ""])
++      error_message = "Service-health metric/label/threshold settings were supplied without prometheus_url, so nothing would query them. Set prometheus_url, or remove the service_* settings."
++    }
+     precondition {
+       condition     = var.integration_request_timeout_seconds <= var.integration_check_interval_seconds
+       error_message = "integration_request_timeout_seconds must not exceed integration_check_interval_seconds, or a slow backend is still in flight when the next check falls due."
+diff --git a/deploy/terraform/variables.tf b/deploy/terraform/variables.tf
+index 5b1982a..6ba8848 100644
+--- a/deploy/terraform/variables.tf
++++ b/deploy/terraform/variables.tf
+@@ -254,3 +254,104 @@ variable "otel_collector_tls_insecure" {
+   type        = bool
+   default     = false
+ }
++
++# --- service health (Prometheus-backed per-service signals) -------------------
++#
++# Beholdr owns the PromQL templates; these settings name the metrics and labels
++# those templates select on. Every one is optional — leave it unset to take
++# Beholdr's default. A value that is set but unusable stops the pod at startup
++# rather than being silently replaced.
++
++variable "prometheus_query_timeout_seconds" {
++  description = "Per-call timeout for Prometheus range and instant queries. Deliberately separate from integration_request_timeout_seconds: a multi-week range query is normal work and must not inherit the timeout sized for a liveness probe."
++  type        = number
++  default     = 30
++}
++
++variable "service_metrics_cache_ttl_seconds" {
++  description = "How long a completed service-health report is reused. The UI polls this endpoint per open tab, and each uncached report is ten or more Prometheus queries, so this is what keeps a busy incident from becoming load on the Prometheus you are debugging with."
++  type        = number
++  default     = 30
++}
++
++variable "service_max_concurrent_queries" {
++  description = "Upper bound on Prometheus queries in flight from this pod at once, across all callers."
++  type        = number
++  default     = 6
++}
++
++variable "service_http_requests_metric" {
++  description = "Counter of HTTP requests handled, e.g. \"aspnetcore_requests_duration_seconds_count\" (Beholdr's default) or \"http_server_request_duration_seconds_count\" for OpenTelemetry semantic conventions. Empty = Beholdr's default."
++  type        = string
++  default     = ""
++}
++
++variable "service_http_errors_metric" {
++  description = "Optional separate counter of failed requests. Empty means errors are counted from service_http_requests_metric filtered by service_http_status_label =~ \"5..\"."
++  type        = string
++  default     = ""
++}
++
++variable "service_http_status_label" {
++  description = "Label carrying the HTTP response status on the requests metric, e.g. \"code\" (Beholdr's default) or \"http_response_status_code\" under OpenTelemetry conventions."
++  type        = string
++  default     = ""
++}
++
++variable "service_app_namespace_label" {
++  description = "Label carrying the Kubernetes namespace on your application metrics. Depends on your Prometheus relabeling, e.g. \"kubernetes_namespace\" or \"namespace\"."
++  type        = string
++  default     = ""
++}
++
++variable "service_app_service_label" {
++  description = "Label carrying the service name on your application metrics, matched against the workload name, e.g. \"app_kubernetes_io_name\" or \"service_name\". Set to a label whose value actually equals the Deployment name, or the HTTP signals will find nothing."
++  type        = string
++  default     = ""
++}
++
++variable "service_app_pod_label" {
++  description = "Label carrying the pod name on your application metrics. Used to scope HTTP signals when service_app_service_label is not available."
++  type        = string
++  default     = ""
++}
++
++variable "service_kube_namespace_label" {
++  description = "Namespace label on cAdvisor/kube-state-metrics series. Almost always \"namespace\"."
++  type        = string
++  default     = ""
++}
++
++variable "service_kube_pod_label" {
++  description = "Pod label on cAdvisor/kube-state-metrics series. Almost always \"pod\"."
++  type        = string
++  default     = ""
++}
++
++variable "service_cpu_basis" {
++  description = "What container CPU usage is scored against: \"limits\" (default — exceeding it means throttling) or \"requests\" (a scheduling floor, where values well above 100% are normal, so raise service_thresholds accordingly)."
++  type        = string
++  default     = ""
++
++  validation {
++    condition     = contains(["", "limits", "requests"], var.service_cpu_basis)
++    error_message = "service_cpu_basis must be \"limits\", \"requests\", or empty for the default."
++  }
++}
++
++variable "service_thresholds" {
++  description = "Health thresholds. Every field is optional; each critical value must be strictly above its warning value (except failing pods, where they may be equal) or the pod refuses to start. Percentages are 0-100; failing pods are counts."
++  type = object({
++    error_rate_warning      = optional(number)
++    error_rate_critical     = optional(number)
++    error_increase_warning  = optional(number)
++    error_increase_critical = optional(number)
++    cpu_warning             = optional(number)
++    cpu_critical            = optional(number)
++    memory_warning          = optional(number)
++    memory_critical         = optional(number)
++    failing_pods_warning    = optional(number)
++    failing_pods_critical   = optional(number)
++  })
++  default = {}
++}
+diff --git a/internal/api/server.go b/internal/api/server.go
+index 26449db..553e503 100644
+--- a/internal/api/server.go
++++ b/internal/api/server.go
+@@ -2,6 +2,7 @@
+ package api
+ 
+ import (
++	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"io/fs"
+@@ -28,12 +29,11 @@ type Server struct {
+ // origins permitted to make cross-origin requests; nil/empty disables CORS
+ // entirely (the default). "*" may be included to allow any origin, which is
+ // only appropriate for local development.
+-func NewServer(col *collect.Collector, integrations *integrations.Monitor, corsOrigins []string, log *slog.Logger) *Server {
+-	var health *servicehealth.Service
+-	if integrations != nil {
+-		health = servicehealth.New(integrations, servicehealth.Config{})
+-	}
+-	return &Server{col: col, integrations: integrations, serviceHealth: health, log: log, corsOrigins: corsOrigins}
++// serviceHealth may be nil, in which case the per-service metrics endpoint
++// reports that Prometheus is not configured. It is built by the caller so an
++// unusable metric profile fails at startup rather than per request.
++func NewServer(col *collect.Collector, integrations *integrations.Monitor, serviceHealth *servicehealth.Service, corsOrigins []string, log *slog.Logger) *Server {
++	return &Server{col: col, integrations: integrations, serviceHealth: serviceHealth, log: log, corsOrigins: corsOrigins}
+ }
+ 
+ func (s *Server) Handler() http.Handler {
+@@ -221,6 +221,9 @@ func (s *Server) microserviceMetrics(w http.ResponseWriter, r *http.Request) {
+ 			break
+ 		}
+ 	}
++	// Resolving against the snapshot before querying is what keeps the path
++	// parameters out of the PromQL templates: only the names of Kubernetes
++	// objects the collector actually saw can reach them.
+ 	if workload == nil {
+ 		http.Error(w, "microservice not found", http.StatusNotFound)
+ 		return
+@@ -234,16 +237,34 @@ func (s *Server) microserviceMetrics(w http.ResponseWriter, r *http.Request) {
+ 		http.Error(w, "Prometheus is not configured", http.StatusServiceUnavailable)
+ 		return
+ 	}
+-	report, err := s.serviceHealth.Query(r.Context(), *workload, window, time.Now())
+-	if errors.Is(err, integrations.ErrPrometheusNotConfigured) {
++
++	// The live pod names let the score pin itself to pods this workload
++	// actually owns; the charts still use the name-shape selector so pods
++	// replaced by earlier rollouts stay in the history.
++	podNames := make([]string, 0, 8)
++	for _, p := range snap.Pods {
++		if p.Namespace == ns && p.Workload == name {
++			podNames = append(podNames, p.Name)
++		}
++	}
++
++	report, err := s.serviceHealth.Query(r.Context(), *workload, podNames, window, time.Now())
++	switch {
++	case err == nil:
++	case errors.Is(err, integrations.ErrPrometheusNotConfigured):
+ 		http.Error(w, "Prometheus is not configured", http.StatusServiceUnavailable)
+ 		return
+-	}
+-	if err != nil {
++	case errors.Is(err, context.Canceled):
++		// The client went away mid-flight; there is nobody to answer.
++		return
++	default:
+ 		s.log.Warn("service health query failed", "namespace", ns, "service", name, "err", err)
+ 		http.Error(w, "service metrics unavailable", http.StatusBadGateway)
+ 		return
+ 	}
++	// Reports are cached server-side for a short window; letting a browser or
++	// proxy hold one for longer would show an operator a stale severity badge.
++	w.Header().Set("Cache-Control", "no-store")
+ 	writeJSON(w, http.StatusOK, report)
+ }
+ 
+diff --git a/internal/api/server_test.go b/internal/api/server_test.go
+index f3313c7..6d401d1 100644
+--- a/internal/api/server_test.go
++++ b/internal/api/server_test.go
+@@ -9,6 +9,7 @@ import (
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -30,10 +31,11 @@ func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
+ type fakeSource struct {
+ 	err         error
+ 	deployments []appsv1.Deployment
++	pods        []corev1.Pod
+ }
+ 
+ func (f *fakeSource) Nodes(context.Context) ([]corev1.Node, error) { return nil, f.err }
+-func (f *fakeSource) Pods(context.Context) ([]corev1.Pod, error)   { return nil, f.err }
++func (f *fakeSource) Pods(context.Context) ([]corev1.Pod, error)   { return f.pods, f.err }
+ func (f *fakeSource) Deployments(context.Context) ([]appsv1.Deployment, error) {
+ 	return f.deployments, f.err
+ }
+@@ -56,7 +58,7 @@ func newTestServer(t *testing.T, corsOrigins []string, collected bool, srcErr er
+ 		cancel()
+ 		col.Run(ctx)
+ 	}
+-	return NewServer(col, nil, corsOrigins, testLogger())
++	return NewServer(col, nil, nil, corsOrigins, testLogger())
+ }
+ 
+ // newTestServerWithMonitor wires a real integration Monitor, already checked
+@@ -67,7 +69,7 @@ func newTestServerWithMonitor(t *testing.T, cfg integrations.Config) *Server {
+ 	col := collect.New(&fakeSource{}, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+ 	mon := integrations.New(cfg, testLogger())
+ 	mon.Check(context.Background())
+-	return NewServer(col, mon, nil, testLogger())
++	return NewServer(col, mon, nil, nil, testLogger())
+ }
+ 
+ func do(s *Server, method, path, origin string) *httptest.ResponseRecorder {
+@@ -277,34 +279,73 @@ func TestIntegrationsResponseNeverCarriesEndpointsOrCredentials(t *testing.T) {
+ 	}
+ }
+ 
+-type apiMetricsQuerier struct{}
++type apiMetricsQuerier struct {
++	mu       sync.Mutex
++	instants []string
++	err      error
++}
+ 
+-func (apiMetricsQuerier) QueryPrometheusRange(_ context.Context, _ string, start, _ time.Time, _ time.Duration) ([]integrations.TimeSeries, error) {
++func (q *apiMetricsQuerier) QueryPrometheusRange(_ context.Context, _ string, start, _ time.Time, _ time.Duration) ([]integrations.TimeSeries, error) {
++	if q.err != nil {
++		return nil, q.err
++	}
+ 	return []integrations.TimeSeries{{Values: []integrations.Sample{{Timestamp: float64(start.Unix()), Value: 0.5}}}}, nil
+ }
+ 
+-func newServiceMetricsServer(t *testing.T) *Server {
++func (q *apiMetricsQuerier) QueryPrometheusInstant(_ context.Context, query string, _ time.Time) ([]integrations.InstantSample, error) {
++	q.mu.Lock()
++	q.instants = append(q.instants, query)
++	q.mu.Unlock()
++	if q.err != nil {
++		return nil, q.err
++	}
++	return []integrations.InstantSample{{Sample: integrations.Sample{Value: 0.5}}}, nil
++}
++
++func newServiceMetricsServer(t *testing.T, querier *apiMetricsQuerier) *Server {
+ 	t.Helper()
+ 	replicas := int32(2)
+-	src := &fakeSource{deployments: []appsv1.Deployment{{
+-		ObjectMeta: metav1.ObjectMeta{Name: "video", Namespace: "production"},
+-		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+-	}}}
++	src := &fakeSource{
++		deployments: []appsv1.Deployment{{
++			ObjectMeta: metav1.ObjectMeta{Name: "video", Namespace: "production"},
++			Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
++		}},
++		pods: []corev1.Pod{
++			pod("production", "video-7d9f8c6b54-x2k9p", "video"),
++			pod("production", "video-7d9f8c6b54-b1n4q", "video"),
++			pod("production", "video-gateway-7d9f8c6b54-zzzzz", "video-gateway"),
++		},
++	}
+ 	col := collect.New(src, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	cancel()
+ 	col.Run(ctx)
+-	s := NewServer(col, nil, nil, testLogger())
+-	s.serviceHealth = servicehealth.New(apiMetricsQuerier{}, servicehealth.Config{})
+-	return s
++	health, err := servicehealth.New(querier, servicehealth.Config{CacheTTL: -1})
++	if err != nil {
++		t.Fatal(err)
++	}
++	return NewServer(col, nil, health, nil, testLogger())
++}
++
++func pod(namespace, name, workload string) corev1.Pod {
++	return corev1.Pod{
++		ObjectMeta: metav1.ObjectMeta{
++			Name: name, Namespace: namespace,
++			Labels: map[string]string{"app": workload},
++		},
++		Status: corev1.PodStatus{Phase: corev1.PodRunning},
++	}
+ }
+ 
+ func TestMicroserviceMetricsEndpoint(t *testing.T) {
+-	s := newServiceMetricsServer(t)
++	s := newServiceMetricsServer(t, &apiMetricsQuerier{})
+ 	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=21d", "")
+ 	if w.Code != http.StatusOK {
+ 		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+ 	}
++	if got := w.Header().Get("Cache-Control"); got != "no-store" {
++		t.Errorf("severity must not be cached by the browser, got %q", got)
++	}
+ 	var report servicehealth.Report
+ 	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
+ 		t.Fatal(err)
+@@ -312,12 +353,82 @@ func TestMicroserviceMetricsEndpoint(t *testing.T) {
+ 	if report.Namespace != "production" || report.Service != "video" || report.Window != "21d" || len(report.Signals) != 4 {
+ 		t.Fatalf("unexpected report: %+v", report)
+ 	}
++	if report.Compared {
++		t.Error("the 21d window must not claim a week-before comparison")
++	}
++}
++
++// The scoring queries must be pinned to the pods this workload owns, never to
++// a name-shaped guess that can pick up a sibling service.
++func TestMicroserviceMetricsScoresOnlyItsOwnPods(t *testing.T) {
++	querier := &apiMetricsQuerier{}
++	s := newServiceMetricsServer(t, querier)
++	if w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=1h", ""); w.Code != http.StatusOK {
++		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
++	}
++	querier.mu.Lock()
++	defer querier.mu.Unlock()
++	if len(querier.instants) == 0 {
++		t.Fatal("no instant queries were issued")
++	}
++	for _, query := range querier.instants {
++		if !strings.Contains(query, "kube_pod_info") {
++			continue
++		}
++		if !strings.Contains(query, "video-7d9f8c6b54-x2k9p") || !strings.Contains(query, "video-7d9f8c6b54-b1n4q") {
++			t.Errorf("scoring query is not pinned to the workload's pods: %s", query)
++		}
++		if strings.Contains(query, "video-gateway") {
++			t.Errorf("scoring query picked up a sibling workload's pod: %s", query)
++		}
++	}
+ }
+ 
+ func TestMicroserviceMetricsRejectsUnsupportedRange(t *testing.T) {
+-	s := newServiceMetricsServer(t)
++	s := newServiceMetricsServer(t, &apiMetricsQuerier{})
+ 	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=90d", "")
+ 	if w.Code != http.StatusBadRequest {
+ 		t.Fatalf("want 400, got %d", w.Code)
+ 	}
+ }
++
++func TestMicroserviceMetricsUnknownWorkloadIs404(t *testing.T) {
++	s := newServiceMetricsServer(t, &apiMetricsQuerier{})
++	w := do(s, http.MethodGet, "/api/microservices/production/nope/metrics?range=1h", "")
++	if w.Code != http.StatusNotFound {
++		t.Fatalf("want 404, got %d", w.Code)
++	}
++}
++
++func TestMicroserviceMetricsWithoutPrometheusIs503(t *testing.T) {
++	querier := &apiMetricsQuerier{err: integrations.ErrPrometheusNotConfigured}
++	s := newServiceMetricsServer(t, querier)
++	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=1h", "")
++	if w.Code != http.StatusServiceUnavailable {
++		t.Fatalf("want 503, got %d: %s", w.Code, w.Body.String())
++	}
++}
++
++// A backend failure is reported through the signal states, not as a dead
++// endpoint: the operator still gets the charts and an actionable message.
++func TestMicroserviceMetricsSurfacesQueryFailuresPerSignal(t *testing.T) {
++	querier := &apiMetricsQuerier{err: integrations.ErrPrometheusQueryRejected}
++	s := newServiceMetricsServer(t, querier)
++	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=1h", "")
++	if w.Code != http.StatusOK {
++		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
++	}
++	var report servicehealth.Report
++	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
++		t.Fatal(err)
++	}
++	if report.Severity != servicehealth.SeverityUnknown {
++		t.Fatalf("failed queries must not read as healthy: %s", report.Severity)
++	}
++	body := w.Body.String()
++	for _, secret := range []string{"kube_pod_info", "aspnetcore_", "namespace="} {
++		if strings.Contains(body, secret) {
++			t.Errorf("response leaked query internals (%q): %s", secret, body)
++		}
++	}
++}
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 203e371..80bbeb1 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -2,6 +2,7 @@
+ package config
+ 
+ import (
++	"fmt"
+ 	"os"
+ 	"strconv"
+ 	"strings"
+@@ -17,6 +18,7 @@ type Config struct {
+ 	Kubeconfig                string        // path when KubeMode != in-cluster
+ 	CORSOrigins               []string      // explicit CORS allowlist; empty = CORS disabled (the default)
+ 	RequestTimout             time.Duration // per-call timeout to the API server
++	PrometheusQueryTimeout    time.Duration // per-call timeout for Prometheus range/instant queries
+ 	PrometheusURL             string        // Prometheus base URL; the check calls /-/ready beneath it
+ 	PrometheusBearerToken     string        // optional bearer token; never exposed through the API
+ 	ElasticsearchURL          string        // Elasticsearch base URL; the check calls /_cluster/health beneath it
+@@ -31,6 +33,54 @@ type Config struct {
+ 	PrometheusTLS    TLSConfig
+ 	ElasticsearchTLS TLSConfig
+ 	OTelCollectorTLS TLSConfig
++
++	// ServiceHealth configures the Prometheus-backed per-service signals.
++	ServiceHealth ServiceHealthConfig
++
++	// Problems collects configuration that was supplied but unusable — an
++	// unparseable threshold, say. Load never guesses what was meant: the
++	// process refuses to start instead, because a silently ignored threshold
++	// is a health badge that is quietly wrong.
++	Problems []string
++}
++
++// ServiceHealthConfig names the metrics, labels and thresholds the per-service
++// health signals are built from. It is transport- and package-agnostic so
++// config keeps no dependency on the servicehealth package; cmd/beholdr adapts
++// it, the same way it does for TLSConfig.
++type ServiceHealthConfig struct {
++	HTTPRequestsMetric string
++	HTTPErrorsMetric   string
++	HTTPStatusLabel    string
++	AppNamespaceLabel  string
++	AppServiceLabel    string
++	AppPodLabel        string
++	KubeNamespaceLabel string
++	KubePodLabel       string
++	// CPUBasis is "limits" or "requests" — what CPU usage is scored against.
++	CPUBasis string
++
++	ErrorRateWarning      float64
++	ErrorRateCritical     float64
++	ErrorIncreaseWarning  float64
++	ErrorIncreaseCritical float64
++	CPUWarning            float64
++	CPUCritical           float64
++	MemoryWarning         float64
++	MemoryCritical        float64
++	FailingPodsWarning    float64
++	FailingPodsCritical   float64
++
++	CacheTTL             time.Duration
++	MaxConcurrentQueries int
++}
++
++// Validate reports configuration that was supplied but could not be used.
++func (c Config) Validate() error {
++	if len(c.Problems) == 0 {
++		return nil
++	}
++	return fmt.Errorf("invalid configuration: %s", strings.Join(c.Problems, "; "))
+ }
+ 
+ // TLSConfig is how one outbound integration verifies its backend.
+@@ -40,7 +90,8 @@ type TLSConfig struct {
+ }
+ 
+ func Load() Config {
+-	return Config{
++	var problems []string
++	cfg := Config{
+ 		Addr:         env("BEHOLDR_ADDR", ":8000"),
+ 		PollInterval: time.Duration(envInt("BEHOLDR_POLL_INTERVAL", 15)) * time.Second,
+ 		HistorySize:  envInt("BEHOLDR_HISTORY_SIZE", 240),
+@@ -59,10 +110,55 @@ func Load() Config {
+ 		OTelCollectorHealthURL:    env("BEHOLDR_OTEL_COLLECTOR_HEALTH_URL", ""),
+ 		IntegrationCheckInterval:  time.Duration(envInt("BEHOLDR_INTEGRATION_CHECK_INTERVAL", 30)) * time.Second,
+ 		IntegrationRequestTimeout: time.Duration(envInt("BEHOLDR_INTEGRATION_REQUEST_TIMEOUT", 5)) * time.Second,
++		PrometheusQueryTimeout:    time.Duration(envInt("BEHOLDR_PROMETHEUS_QUERY_TIMEOUT", 30)) * time.Second,
+ 		PrometheusTLS:             tlsConfig("BEHOLDR_PROMETHEUS"),
+ 		ElasticsearchTLS:          tlsConfig("BEHOLDR_ELASTICSEARCH"),
+ 		OTelCollectorTLS:          tlsConfig("BEHOLDR_OTEL_COLLECTOR"),
+ 	}
++	cfg.ServiceHealth = ServiceHealthConfig{
++		HTTPRequestsMetric: env("BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC", ""),
++		HTTPErrorsMetric:   env("BEHOLDR_SERVICE_HTTP_ERRORS_METRIC", ""),
++		HTTPStatusLabel:    env("BEHOLDR_SERVICE_HTTP_STATUS_LABEL", ""),
++		AppNamespaceLabel:  env("BEHOLDR_SERVICE_APP_NAMESPACE_LABEL", ""),
++		AppServiceLabel:    env("BEHOLDR_SERVICE_APP_SERVICE_LABEL", ""),
++		AppPodLabel:        env("BEHOLDR_SERVICE_APP_POD_LABEL", ""),
++		KubeNamespaceLabel: env("BEHOLDR_SERVICE_KUBE_NAMESPACE_LABEL", ""),
++		KubePodLabel:       env("BEHOLDR_SERVICE_KUBE_POD_LABEL", ""),
++		CPUBasis:           env("BEHOLDR_SERVICE_CPU_BASIS", ""),
++
++		ErrorRateWarning:      envFloat("BEHOLDR_SERVICE_ERROR_RATE_WARNING", &problems),
++		ErrorRateCritical:     envFloat("BEHOLDR_SERVICE_ERROR_RATE_CRITICAL", &problems),
++		ErrorIncreaseWarning:  envFloat("BEHOLDR_SERVICE_ERROR_INCREASE_WARNING", &problems),
++		ErrorIncreaseCritical: envFloat("BEHOLDR_SERVICE_ERROR_INCREASE_CRITICAL", &problems),
++		CPUWarning:            envFloat("BEHOLDR_SERVICE_CPU_WARNING", &problems),
++		CPUCritical:           envFloat("BEHOLDR_SERVICE_CPU_CRITICAL", &problems),
++		MemoryWarning:         envFloat("BEHOLDR_SERVICE_MEMORY_WARNING", &problems),
++		MemoryCritical:        envFloat("BEHOLDR_SERVICE_MEMORY_CRITICAL", &problems),
++		FailingPodsWarning:    envFloat("BEHOLDR_SERVICE_FAILING_PODS_WARNING", &problems),
++		FailingPodsCritical:   envFloat("BEHOLDR_SERVICE_FAILING_PODS_CRITICAL", &problems),
++
++		CacheTTL:             time.Duration(envInt("BEHOLDR_SERVICE_METRICS_CACHE_TTL", 30)) * time.Second,
++		MaxConcurrentQueries: envInt("BEHOLDR_SERVICE_MAX_CONCURRENT_QUERIES", 6),
++	}
++	cfg.Problems = problems
++	return cfg
++}
++
++// envFloat returns 0 when the variable is unset — "0" means "take the default"
++// throughout ServiceHealthConfig. A value that is set but unparseable is
++// recorded as a problem rather than falling back, so a mistyped threshold stops
++// the process instead of quietly reverting to a different one.
++func envFloat(k string, problems *[]string) float64 {
++	v, ok := os.LookupEnv(k)
++	if !ok || strings.TrimSpace(v) == "" {
++		return 0
++	}
++	f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
++	if err != nil {
++		*problems = append(*problems, fmt.Sprintf("%s is not a number: %q", k, v))
++		return 0
++	}
++	return f
+ }
+ 
+ func tlsConfig(prefix string) TLSConfig {
+diff --git a/internal/config/config_test.go b/internal/config/config_test.go
+index fd97810..bfeb611 100644
+--- a/internal/config/config_test.go
++++ b/internal/config/config_test.go
+@@ -1,6 +1,7 @@
+ package config
+ 
+ import (
++	"strings"
+ 	"testing"
+ 	"time"
+ )
+@@ -107,3 +108,64 @@ func TestInsecureTLSDefaultsToOffOnGarbageInput(t *testing.T) {
+ 		}
+ 	}
+ }
++
++func TestServiceHealthDefaultsAreUnsetSoThePackageOwnsThem(t *testing.T) {
++	cfg := Load()
++	sh := cfg.ServiceHealth
++	if sh.HTTPRequestsMetric != "" || sh.KubePodLabel != "" || sh.CPUBasis != "" {
++		t.Fatalf("unset service-health fields must stay empty so servicehealth applies its own defaults: %+v", sh)
++	}
++	if sh.ErrorRateWarning != 0 || sh.CPUCritical != 0 {
++		t.Fatalf("unset thresholds must be zero: %+v", sh)
++	}
++	if sh.CacheTTL != 30*time.Second || sh.MaxConcurrentQueries != 6 {
++		t.Fatalf("unexpected query-shaping defaults: %+v", sh)
++	}
++	if cfg.PrometheusQueryTimeout != 30*time.Second {
++		t.Fatalf("query timeout must not inherit the 5s health-check timeout: %v", cfg.PrometheusQueryTimeout)
++	}
++	if err := cfg.Validate(); err != nil {
++		t.Fatalf("default configuration must be valid: %v", err)
++	}
++}
++
++func TestServiceHealthOverridesAreRead(t *testing.T) {
++	t.Setenv("BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC", "http_server_request_duration_seconds_count")
++	t.Setenv("BEHOLDR_SERVICE_HTTP_STATUS_LABEL", "http_response_status_code")
++	t.Setenv("BEHOLDR_SERVICE_APP_SERVICE_LABEL", "service_name")
++	t.Setenv("BEHOLDR_SERVICE_CPU_BASIS", "requests")
++	t.Setenv("BEHOLDR_SERVICE_CPU_WARNING", "150")
++	t.Setenv("BEHOLDR_SERVICE_CPU_CRITICAL", "300")
++	t.Setenv("BEHOLDR_PROMETHEUS_QUERY_TIMEOUT", "45")
++
++	cfg := Load()
++	if err := cfg.Validate(); err != nil {
++		t.Fatal(err)
++	}
++	sh := cfg.ServiceHealth
++	if sh.HTTPRequestsMetric != "http_server_request_duration_seconds_count" ||
++		sh.HTTPStatusLabel != "http_response_status_code" ||
++		sh.AppServiceLabel != "service_name" || sh.CPUBasis != "requests" {
++		t.Fatalf("metric profile not read: %+v", sh)
++	}
++	if sh.CPUWarning != 150 || sh.CPUCritical != 300 {
++		t.Fatalf("thresholds not read: %+v", sh)
++	}
++	if cfg.PrometheusQueryTimeout != 45*time.Second {
++		t.Fatalf("query timeout not read: %v", cfg.PrometheusQueryTimeout)
++	}
++}
++
++// A mistyped threshold must stop the process. Falling back to the default
++// would leave an operator believing they had set a threshold they had not.
++func TestUnparseableThresholdIsRefusedNotIgnored(t *testing.T) {
++	t.Setenv("BEHOLDR_SERVICE_MEMORY_CRITICAL", "ninety-five")
++	cfg := Load()
++	err := cfg.Validate()
++	if err == nil {
++		t.Fatal("want a configuration error")
++	}
++	if !strings.Contains(err.Error(), "BEHOLDR_SERVICE_MEMORY_CRITICAL") {
++		t.Fatalf("error should name the variable: %v", err)
++	}
++}
+diff --git a/internal/integrations/monitor.go b/internal/integrations/monitor.go
+index f7ee96e..648fcd5 100644
+--- a/internal/integrations/monitor.go
++++ b/internal/integrations/monitor.go
+@@ -54,7 +54,12 @@ type Config struct {
+ 	CollectorTLS       TLS
+ 
+ 	Interval time.Duration
+-	Timeout  time.Duration
++	// Timeout bounds a single connectivity health check.
++	Timeout time.Duration
++	// QueryTimeout bounds a single Prometheus range or instant query. These are
++	// orders of magnitude more expensive than a health check — a multi-week
++	// range query is normal work — so they must not inherit Timeout.
++	QueryTimeout time.Duration
+ }
+ 
+ type ProviderStatus struct {
+@@ -85,8 +90,13 @@ type Snapshot struct {
+ type inspector func(body []byte) (detail string, degraded bool)
+ 
+ type provider struct {
+-	name       string
+-	signal     string
++	name string
++	// signal is the human-facing label for what this backend supplies.
++	signal string
++	// baseURL is the configured root. endpoint is the specific URL the health
++	// check calls; query paths are derived from baseURL instead, so a provider
++	// used for both never has to be rewritten in place.
++	baseURL    string
+ 	endpoint   string
+ 	authHeader string
+ 	client     *http.Client
+@@ -119,51 +129,80 @@ func New(cfg Config, log *slog.Logger) *Monitor {
+ 		log = slog.Default()
+ 	}
+ 
+-	providers := []provider{
+-		{
+-			name:       "prometheus",
++	if cfg.QueryTimeout <= 0 {
++		cfg.QueryTimeout = 30 * time.Second
++	}
++
++	// Each entry pairs a provider with its own TLS settings, so the two can
++	// never drift apart the way parallel slices indexed by position can.
++	specs := []struct {
++		provider provider
++		tls      TLS
++	}{
++		{provider{
++			name:       prometheusProvider,
+ 			signal:     "metrics",
++			baseURL:    strings.TrimSpace(cfg.PrometheusURL),
+ 			endpoint:   endpoint(cfg.PrometheusURL, "/-/ready"),
+ 			authHeader: bearer(cfg.PrometheusBearerToken),
+-		},
+-		{
++		}, cfg.PrometheusTLS},
++		{provider{
+ 			name:       "elasticsearch",
+ 			signal:     "logs and traces",
++			baseURL:    strings.TrimSpace(cfg.ElasticsearchURL),
+ 			endpoint:   endpoint(cfg.ElasticsearchURL, "/_cluster/health?local=true"),
+ 			authHeader: apiKey(cfg.ElasticsearchAPIKey),
+ 			inspect:    elasticsearchHealth,
+-		},
+-		{
++		}, cfg.ElasticsearchTLS},
++		{provider{
+ 			name:     "otel-collector",
+ 			signal:   "OTLP ingress",
+ 			endpoint: strings.TrimSpace(cfg.CollectorHealthURL),
+-		},
++		}, cfg.CollectorTLS},
+ 	}
+-	tlsCfg := []TLS{cfg.PrometheusTLS, cfg.ElasticsearchTLS, cfg.CollectorTLS}
+ 
+-	initial := Snapshot{Providers: make([]ProviderStatus, 0, len(providers))}
+-	for i := range providers {
+-		p := &providers[i]
+-		p.skipVerify = tlsCfg[i].Insecure
+-		client, err := newClient(tlsCfg[i], cfg.Timeout)
++	providers := make([]provider, 0, len(specs))
++	initial := Snapshot{Providers: make([]ProviderStatus, 0, len(specs))}
++	for _, spec := range specs {
++		p := spec.provider
++		p.skipVerify = spec.tls.Insecure
++		client, err := newClient(spec.tls, cfg.Timeout)
+ 		if err != nil {
+ 			p.setupErr = "TLS trust store could not be loaded"
+ 			log.Error("integration TLS configuration is unusable",
+-				"provider", p.name, "ca_file", tlsCfg[i].CAFile, "err", err)
++				"provider", p.name, "ca_file", spec.tls.CAFile, "err", err)
+ 		}
+ 		p.client = client
+ 		if p.skipVerify && p.endpoint != "" {
+ 			log.Warn("integration TLS verification is DISABLED — traffic to this backend is not authenticated",
+ 				"provider", p.name)
+ 		}
++		providers = append(providers, p)
+ 		initial.Providers = append(initial.Providers, ProviderStatus{
+ 			Name: p.name, Signal: p.signal, Configured: p.endpoint != "",
+ 			TLSSkipVerify: p.skipVerify,
+ 		})
+ 	}
+ 
+-	prometheusQuery := providers[0]
+-	prometheusQuery.endpoint = endpoint(cfg.PrometheusURL, "/api/v1/query_range")
++	// The query path is resolved by name, never by position: a copy taken from
++	// the wrong index would send Prometheus's queries — and whichever
++	// credential that provider carries — to a different backend entirely.
++	prometheusQuery, ok := findProvider(providers, prometheusProvider)
++	if !ok {
++		// Unreachable while the spec list above declares a prometheus entry.
++		// Panicking here is deliberate: silently degrading to "queries never
++		// work" would be discovered in production, not in a test.
++		panic("integrations: no provider named " + prometheusProvider)
++	}
++	// Range and instant queries are minutes of Prometheus work, not the
++	// sub-second liveness probe the health client is sized for, so they get a
++	// client with their own timeout and their own connection pool.
++	queryClient, err := newClient(cfg.PrometheusTLS, cfg.QueryTimeout)
++	if err != nil {
++		prometheusQuery.setupErr = "TLS trust store could not be loaded"
++	}
++	prometheusQuery.client = queryClient
++	prometheusQuery.endpoint = ""
+ 
+ 	return &Monitor{
+ 		providers:       providers,
+@@ -174,6 +213,17 @@ func New(cfg Config, log *slog.Logger) *Monitor {
+ 	}
+ }
+ 
++const prometheusProvider = "prometheus"
++
++func findProvider(providers []provider, name string) (provider, bool) {
++	for _, p := range providers {
++		if p.name == name {
++			return p, true
++		}
++	}
++	return provider{}, false
++}
++
+ // newClient builds a provider-scoped client. Each provider gets its own so one
+ // backend's trust settings can never apply to another.
+ func newClient(t TLS, timeout time.Duration) (*http.Client, error) {
+diff --git a/internal/integrations/prometheus.go b/internal/integrations/prometheus.go
+index d7f435a..3cc4a2e 100644
+--- a/internal/integrations/prometheus.go
++++ b/internal/integrations/prometheus.go
+@@ -13,11 +13,37 @@ import (
+ 	"time"
+ )
+ 
+-const maxPrometheusResponseBytes = 16 << 20
++// maxPrometheusResponseBytes bounds what a single query may pull into memory.
++// A query is capped at maxRangePoints evaluation points and Beholdr's own
++// templates aggregate to a handful of series, so a legitimate response is tens
++// of kilobytes. This cap exists for a broken or hostile upstream, and several
++// queries run concurrently per request, so it is deliberately close to the
++// realistic ceiling rather than an order of magnitude above it.
++const maxPrometheusResponseBytes = 2 << 20
++
++// maxRangePoints is the number of evaluation points a single range query may
++// request. It also bounds the response size together with the cap above.
++const maxRangePoints = 2_000
+ 
+ var (
++	// ErrPrometheusNotConfigured means no Prometheus URL was supplied.
+ 	ErrPrometheusNotConfigured = errors.New("prometheus is not configured")
+-	ErrPrometheusQueryFailed   = errors.New("prometheus query failed")
++	// ErrPrometheusQueryFailed is the unclassified fallback: a transport
++	// failure, or a response Beholdr could not parse.
++	ErrPrometheusQueryFailed = errors.New("prometheus query failed")
++	// ErrPrometheusQueryRejected means Prometheus understood the request and
++	// refused it — almost always a malformed query or an unparseable
++	// parameter. Operator-actionable: the query template or its configured
++	// metric/label names are wrong.
++	ErrPrometheusQueryRejected = errors.New("prometheus rejected the query")
++	// ErrPrometheusUnauthorized means the configured credential was refused.
++	ErrPrometheusUnauthorized = errors.New("prometheus rejected the credentials")
++	// ErrPrometheusUnavailable means Prometheus answered but could not serve
++	// the query (5xx, or its own "unavailable" error type).
++	ErrPrometheusUnavailable = errors.New("prometheus is unavailable")
++	// ErrPrometheusTimeout means the query exceeded its deadline, on either
++	// side of the connection.
++	ErrPrometheusTimeout = errors.New("prometheus query timed out")
+ )
+ 
+ type Sample struct {
+@@ -30,37 +56,97 @@ type TimeSeries struct {
+ 	Values []Sample          `json:"values"`
+ }
+ 
++// InstantSample is one element of a vector result.
++type InstantSample struct {
++	Metric map[string]string `json:"metric"`
++	Sample Sample            `json:"sample"`
++}
++
+ // QueryPrometheusRange evaluates one bounded matrix query. Callers own the
+ // query templates; Beholdr never accepts arbitrary PromQL directly from an HTTP
+ // request. This method only handles transport and the stable Prometheus API
+ // envelope.
+ func (m *Monitor) QueryPrometheusRange(ctx context.Context, query string, start, end time.Time, step time.Duration) ([]TimeSeries, error) {
+-	p := m.prometheusQuery
+-	if p.endpoint == "" {
+-		return nil, ErrPrometheusNotConfigured
++	if step <= 0 || !end.After(start) {
++		return nil, ErrPrometheusQueryRejected
+ 	}
+-	if p.setupErr != "" || p.client == nil {
+-		return nil, ErrPrometheusQueryFailed
++	if end.Sub(start) > 31*24*time.Hour || end.Sub(start)/step > maxRangePoints {
++		return nil, ErrPrometheusQueryRejected
+ 	}
+-	if strings.TrimSpace(query) == "" || len(query) > 32<<10 || step <= 0 || !end.After(start) {
++	form := url.Values{
++		"query": {query},
++		"start": {formatTime(start)},
++		"end":   {formatTime(end)},
++		"step":  {strconv.FormatFloat(step.Seconds(), 'f', -1, 64)},
++	}
++	envelope, err := m.postPrometheus(ctx, "range", queryRangePath, query, form)
++	if err != nil {
++		return nil, err
++	}
++	if envelope.Data.ResultType != "matrix" {
+ 		return nil, ErrPrometheusQueryFailed
+ 	}
+-	if end.Sub(start) > 31*24*time.Hour || end.Sub(start)/step > 2_000 {
++	result := make([]TimeSeries, 0, len(envelope.Data.Result))
++	for _, raw := range envelope.Data.Result {
++		series := TimeSeries{Metric: raw.Metric, Values: make([]Sample, 0, len(raw.Values))}
++		for _, value := range raw.Values {
++			if sample, ok := value.sample(); ok {
++				series.Values = append(series.Values, sample)
++			}
++		}
++		result = append(result, series)
++	}
++	return result, nil
++}
++
++// QueryPrometheusInstant evaluates one vector query at a single instant. It is
++// what the health signals are scored from: a range query's last point is only
++// as fresh as that range's step, so scoring from it would make a service's
++// severity depend on which chart window the operator happened to select.
++func (m *Monitor) QueryPrometheusInstant(ctx context.Context, query string, at time.Time) ([]InstantSample, error) {
++	form := url.Values{"query": {query}, "time": {formatTime(at)}}
++	envelope, err := m.postPrometheus(ctx, "instant", queryPath, query, form)
++	if err != nil {
++		return nil, err
++	}
++	if envelope.Data.ResultType != "vector" {
+ 		return nil, ErrPrometheusQueryFailed
+ 	}
++	result := make([]InstantSample, 0, len(envelope.Data.Result))
++	for _, raw := range envelope.Data.Result {
++		sample, ok := raw.Value.sample()
++		if !ok {
++			continue
++		}
++		result = append(result, InstantSample{Metric: raw.Metric, Sample: sample})
++	}
++	return result, nil
++}
+ 
+-	form := url.Values{
+-		"query": {query},
+-		"start": {strconv.FormatFloat(float64(start.UnixNano())/1e9, 'f', 3, 64)},
+-		"end":   {strconv.FormatFloat(float64(end.UnixNano())/1e9, 'f', 3, 64)},
+-		"step":  {strconv.FormatFloat(step.Seconds(), 'f', -1, 64)},
++const (
++	queryPath      = "/api/v1/query"
++	queryRangePath = "/api/v1/query_range"
++)
++
++func (m *Monitor) postPrometheus(ctx context.Context, kind, path, query string, form url.Values) (prometheusEnvelope, error) {
++	var zero prometheusEnvelope
++	p := m.prometheusQuery
++	if p.baseURL == "" {
++		return zero, ErrPrometheusNotConfigured
++	}
++	if p.setupErr != "" || p.client == nil {
++		return zero, ErrPrometheusQueryFailed
+ 	}
+-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, strings.NewReader(form.Encode()))
++	if strings.TrimSpace(query) == "" || len(query) > 32<<10 {
++		return zero, ErrPrometheusQueryRejected
++	}
++
++	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint(p.baseURL, path), strings.NewReader(form.Encode()))
+ 	if err != nil {
+-		return nil, ErrPrometheusQueryFailed
++		return zero, ErrPrometheusQueryFailed
+ 	}
+ 	if (req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.Host == "" || req.URL.User != nil {
+-		return nil, ErrPrometheusQueryFailed
++		return zero, ErrPrometheusQueryFailed
+ 	}
+ 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+ 	if p.authHeader != "" {
+@@ -69,46 +155,96 @@ func (m *Monitor) QueryPrometheusRange(ctx context.Context, query string, start,
+ 
+ 	resp, err := p.client.Do(req)
+ 	if err != nil {
+-		m.log.Warn("Prometheus range query failed", "reason", classify(err), "err", err)
+-		return nil, ErrPrometheusQueryFailed
++		reason := classify(err)
++		m.log.Warn("Prometheus query failed", "kind", kind, "reason", reason, "err", err)
++		if errors.Is(err, context.DeadlineExceeded) || reason == "timed out" {
++			return zero, ErrPrometheusTimeout
++		}
++		return zero, ErrPrometheusQueryFailed
+ 	}
+ 	defer resp.Body.Close()
+-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+-		m.log.Warn("Prometheus range query returned an error", "status", resp.StatusCode)
+-		return nil, ErrPrometheusQueryFailed
+-	}
+ 
+-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxPrometheusResponseBytes+1))
+-	if err != nil || len(body) > maxPrometheusResponseBytes {
+-		return nil, ErrPrometheusQueryFailed
++	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxPrometheusResponseBytes+1))
++	if readErr != nil || len(body) > maxPrometheusResponseBytes {
++		m.log.Warn("Prometheus response was unreadable or oversized", "kind", kind, "bytes", len(body))
++		return zero, ErrPrometheusQueryFailed
+ 	}
++
+ 	var envelope prometheusEnvelope
+-	if err := json.Unmarshal(body, &envelope); err != nil || envelope.Status != "success" || envelope.Data.ResultType != "matrix" {
+-		return nil, ErrPrometheusQueryFailed
+-	}
++	parsed := json.Unmarshal(body, &envelope) == nil
+ 
+-	result := make([]TimeSeries, 0, len(envelope.Data.Result))
+-	for _, raw := range envelope.Data.Result {
+-		series := TimeSeries{Metric: raw.Metric, Values: make([]Sample, 0, len(raw.Values))}
+-		for _, value := range raw.Values {
+-			sample, ok := value.sample()
+-			if ok {
+-				series.Values = append(series.Values, sample)
++	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
++		queryErr := statusError(resp.StatusCode)
++		// Prometheus reports a small, documented errorType enum alongside its
++		// error text. Only the enum is trusted; the free-text message stays in
++		// the log so nothing an upstream writes can reach Beholdr's own API.
++		if parsed && envelope.ErrorType != "" {
++			if mapped, ok := errorTypeError(envelope.ErrorType); ok {
++				queryErr = mapped
+ 			}
+ 		}
+-		result = append(result, series)
++		m.log.Warn("Prometheus returned an error",
++			"kind", kind, "status", resp.StatusCode,
++			"error_type", envelope.ErrorType, "detail", envelope.Error)
++		return zero, queryErr
+ 	}
+-	return result, nil
++	if !parsed || envelope.Status != "success" {
++		if parsed && envelope.ErrorType != "" {
++			if mapped, ok := errorTypeError(envelope.ErrorType); ok {
++				m.log.Warn("Prometheus reported a query error",
++					"kind", kind, "error_type", envelope.ErrorType, "detail", envelope.Error)
++				return zero, mapped
++			}
++		}
++		return zero, ErrPrometheusQueryFailed
++	}
++	return envelope, nil
++}
++
++func statusError(status int) error {
++	switch {
++	case status == http.StatusUnauthorized || status == http.StatusForbidden:
++		return ErrPrometheusUnauthorized
++	case status == http.StatusRequestTimeout || status == http.StatusGatewayTimeout:
++		return ErrPrometheusTimeout
++	case status == http.StatusTooManyRequests || status >= 500:
++		return ErrPrometheusUnavailable
++	case status >= 400:
++		return ErrPrometheusQueryRejected
++	}
++	return ErrPrometheusQueryFailed
++}
++
++// errorTypeError maps Prometheus's documented errorType enum onto Beholdr's
++// closed error vocabulary. Unknown values are ignored rather than surfaced.
++func errorTypeError(errorType string) (error, bool) {
++	switch errorType {
++	case "bad_data":
++		return ErrPrometheusQueryRejected, true
++	case "timeout", "canceled":
++		return ErrPrometheusTimeout, true
++	case "unavailable":
++		return ErrPrometheusUnavailable, true
++	case "execution", "internal":
++		return ErrPrometheusUnavailable, true
++	}
++	return nil, false
++}
++
++func formatTime(t time.Time) string {
++	return strconv.FormatFloat(float64(t.UnixNano())/1e9, 'f', 3, 64)
+ }
+ 
+ type prometheusEnvelope struct {
+-	Status string `json:"status"`
+-	Data   struct {
++	Status    string `json:"status"`
++	ErrorType string `json:"errorType"`
++	Error     string `json:"error"`
++	Data      struct {
+ 		ResultType string `json:"resultType"`
+ 		Result     []struct {
+ 			Metric map[string]string `json:"metric"`
+ 			Values []prometheusValue `json:"values"`
++			Value  prometheusValue   `json:"value"`
+ 		} `json:"result"`
+ 	} `json:"data"`
+ }
+@@ -116,6 +252,9 @@ type prometheusEnvelope struct {
+ type prometheusValue [2]json.RawMessage
+ 
+ func (v prometheusValue) sample() (Sample, bool) {
++	if len(v[0]) == 0 || len(v[1]) == 0 {
++		return Sample{}, false
++	}
+ 	var timestamp float64
+ 	var valueText string
+ 	if err := json.Unmarshal(v[0], &timestamp); err != nil {
+diff --git a/internal/integrations/prometheus_test.go b/internal/integrations/prometheus_test.go
+index ac66f29..78832bf 100644
+--- a/internal/integrations/prometheus_test.go
++++ b/internal/integrations/prometheus_test.go
+@@ -2,6 +2,8 @@ package integrations
+ 
+ import (
+ 	"context"
++	"errors"
++	"io"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"strings"
+@@ -64,11 +66,14 @@ func TestQueryPrometheusRangeRejectsUnconfiguredAndUnboundedQueries(t *testing.T
+ 	}))
+ 	defer server.Close()
+ 	m = New(Config{PrometheusURL: server.URL}, discardLogger())
+-	if _, err := m.QueryPrometheusRange(context.Background(), strings.Repeat("x", 33<<10), now.Add(-time.Hour), now, time.Minute); err != ErrPrometheusQueryFailed {
+-		t.Fatalf("want bounded-query failure, got %v", err)
++	if _, err := m.QueryPrometheusRange(context.Background(), strings.Repeat("x", 33<<10), now.Add(-time.Hour), now, time.Minute); !errors.Is(err, ErrPrometheusQueryRejected) {
++		t.Fatalf("want bounded-query rejection, got %v", err)
+ 	}
+-	if _, err := m.QueryPrometheusRange(context.Background(), "up", now.Add(-30*24*time.Hour), now, time.Second); err != ErrPrometheusQueryFailed {
+-		t.Fatalf("want point-count failure, got %v", err)
++	if _, err := m.QueryPrometheusRange(context.Background(), "up", now.Add(-30*24*time.Hour), now, time.Second); !errors.Is(err, ErrPrometheusQueryRejected) {
++		t.Fatalf("want point-count rejection, got %v", err)
++	}
++	if _, err := m.QueryPrometheusRange(context.Background(), "up", now, now.Add(-time.Hour), time.Minute); !errors.Is(err, ErrPrometheusQueryRejected) {
++		t.Fatalf("want inverted-range rejection, got %v", err)
+ 	}
+ }
+ 
+@@ -85,3 +90,147 @@ func TestQueryPrometheusRangeDoesNotExposeUpstreamError(t *testing.T) {
+ 		t.Fatalf("want sanitized query failure, got %v", err)
+ 	}
+ }
++
++func TestQueryPrometheusInstant(t *testing.T) {
++	var gotPath, gotTime string
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		_ = r.ParseForm()
++		gotPath, gotTime = r.URL.Path, r.FormValue("time")
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"vector","result":[{"metric":{},"value":[1000,"4.25"]}]}}`))
++	}))
++	defer server.Close()
++
++	m := New(Config{PrometheusURL: server.URL, Timeout: time.Second}, discardLogger())
++	samples, err := m.QueryPrometheusInstant(context.Background(), "up", time.Unix(1000, 0))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if gotPath != "/api/v1/query" || gotTime != "1000.000" {
++		t.Fatalf("unexpected request: path=%q time=%q", gotPath, gotTime)
++	}
++	if len(samples) != 1 || samples[0].Sample.Value != 4.25 {
++		t.Fatalf("unexpected samples: %+v", samples)
++	}
++}
++
++func TestInstantAndRangeUseTheirOwnPaths(t *testing.T) {
++	var paths []string
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		paths = append(paths, r.URL.Path)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
++	}))
++	defer server.Close()
++
++	m := New(Config{PrometheusURL: server.URL + "/prom", Timeout: time.Second}, discardLogger())
++	now := time.Now()
++	_, _ = m.QueryPrometheusRange(context.Background(), "up", now.Add(-time.Hour), now, time.Minute)
++	_, _ = m.QueryPrometheusInstant(context.Background(), "up", now)
++	want := []string{"/prom/api/v1/query_range", "/prom/api/v1/query"}
++	if len(paths) != 2 || paths[0] != want[0] || paths[1] != want[1] {
++		t.Fatalf("want %v, got %v", want, paths)
++	}
++}
++
++// Prometheus reports a small documented enum alongside its free-text error.
++// Only the enum is trusted, and it is what tells an operator whether to fix
++// their query, their credentials, or their Prometheus.
++func TestPrometheusErrorsAreClassified(t *testing.T) {
++	cases := []struct {
++		name   string
++		status int
++		body   string
++		want   error
++	}{
++		{"bad query", http.StatusBadRequest, `{"status":"error","errorType":"bad_data","error":"parse error at char 3"}`, ErrPrometheusQueryRejected},
++		{"credentials", http.StatusUnauthorized, ``, ErrPrometheusUnauthorized},
++		{"upstream down", http.StatusBadGateway, ``, ErrPrometheusUnavailable},
++		{"query timeout", http.StatusUnprocessableEntity, `{"status":"error","errorType":"timeout","error":"query timed out"}`, ErrPrometheusTimeout},
++		{"execution error", http.StatusUnprocessableEntity, `{"status":"error","errorType":"execution","error":"too many samples"}`, ErrPrometheusUnavailable},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++				w.Header().Set("Content-Type", "application/json")
++				w.WriteHeader(tc.status)
++				_, _ = io.WriteString(w, tc.body)
++			}))
++			defer server.Close()
++
++			m := New(Config{PrometheusURL: server.URL, Timeout: time.Second}, discardLogger())
++			now := time.Now()
++			_, err := m.QueryPrometheusRange(context.Background(), "up", now.Add(-time.Hour), now, time.Minute)
++			if !errors.Is(err, tc.want) {
++				t.Fatalf("want %v, got %v", tc.want, err)
++			}
++			if err != nil && strings.Contains(err.Error(), "parse error") {
++				t.Fatalf("upstream detail leaked into the error: %v", err)
++			}
++		})
++	}
++}
++
++// The query client is selected by provider name. Taking it positionally from
++// the provider slice meant that reordering that slice would start sending
++// another backend's credential — Elasticsearch's API key — to Prometheus's
++// query API.
++func TestQueriesOnlyEverCarryThePrometheusCredential(t *testing.T) {
++	var seen string
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		seen = r.Header.Get("Authorization")
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
++	}))
++	defer server.Close()
++
++	m := New(Config{
++		PrometheusURL:         server.URL,
++		PrometheusBearerToken: "prom-token",
++		ElasticsearchURL:      server.URL,
++		ElasticsearchAPIKey:   "elastic-key-should-never-appear",
++		Timeout:               time.Second,
++	}, discardLogger())
++	now := time.Now()
++	if _, err := m.QueryPrometheusRange(context.Background(), "up", now.Add(-time.Hour), now, time.Minute); err != nil {
++		t.Fatal(err)
++	}
++	if seen != "Bearer prom-token" {
++		t.Fatalf("unexpected credential on the query path: %q", seen)
++	}
++}
++
++// A multi-week range query is normal work and must not inherit the timeout
++// sized for a sub-second liveness probe.
++func TestQueriesDoNotInheritTheHealthCheckTimeout(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		time.Sleep(150 * time.Millisecond)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(`{"status":"success","data":{"resultType":"matrix","result":[]}}`))
++	}))
++	defer server.Close()
++
++	m := New(Config{
++		PrometheusURL: server.URL,
++		Timeout:       20 * time.Millisecond, // health checks stay snappy
++		QueryTimeout:  5 * time.Second,       // queries get room to work
++	}, discardLogger())
++	now := time.Now()
++	if _, err := m.QueryPrometheusRange(context.Background(), "up", now.Add(-time.Hour), now, time.Minute); err != nil {
++		t.Fatalf("query should outlive the health-check timeout: %v", err)
++	}
++}
++
++func TestSlowQueriesReportATimeout(t *testing.T) {
++	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		time.Sleep(200 * time.Millisecond)
++		_, _ = io.WriteString(w, `{}`)
++	}))
++	defer server.Close()
++
++	m := New(Config{PrometheusURL: server.URL, QueryTimeout: 20 * time.Millisecond}, discardLogger())
++	now := time.Now()
++	if _, err := m.QueryPrometheusRange(context.Background(), "up", now.Add(-time.Hour), now, time.Minute); !errors.Is(err, ErrPrometheusTimeout) {
++		t.Fatalf("want ErrPrometheusTimeout, got %v", err)
++	}
++}
+diff --git a/internal/servicehealth/cache.go b/internal/servicehealth/cache.go
+new file mode 100644
+index 0000000..b2f8ee4
+--- /dev/null
++++ b/internal/servicehealth/cache.go
+@@ -0,0 +1,120 @@
++package servicehealth
++
++import (
++	"context"
++	"sync"
++	"time"
++)
++
++// reportCache collapses concurrent and repeated evaluations of the same
++// (workload, window) into one Prometheus round trip.
++//
++// Two things make this necessary rather than an optimisation. The UI polls the
++// metrics endpoint on a timer, once per open browser tab, and Beholdr has no
++// authentication of its own — whatever sits in front of the ingress decides who
++// reaches it, and any of them can hold the page open. And a single uncached
++// report is ten or more range and instant queries. Without this, a handful of
++// engineers watching the same services during an incident is a sustained load
++// spike on the Prometheus they are relying on to diagnose it.
++type reportCache struct {
++	ttl        time.Duration
++	maxEntries int
++
++	mu       sync.Mutex
++	entries  map[string]*cacheEntry
++	inflight map[string]*flight
++}
++
++type cacheEntry struct {
++	report  Report
++	expires time.Time
++}
++
++// flight is one in-progress evaluation. Late arrivals wait on done rather than
++// starting a second identical evaluation.
++type flight struct {
++	done   chan struct{}
++	report Report
++	err    error
++}
++
++func newReportCache(ttl time.Duration, maxEntries int) *reportCache {
++	return &reportCache{
++		ttl:        ttl,
++		maxEntries: maxEntries,
++		entries:    map[string]*cacheEntry{},
++		inflight:   map[string]*flight{},
++	}
++}
++
++func (c *reportCache) do(ctx context.Context, key string, evaluate func(context.Context) (Report, error)) (Report, error) {
++	if c == nil || c.ttl < 0 {
++		return evaluate(ctx)
++	}
++
++	c.mu.Lock()
++	if entry, ok := c.entries[key]; ok && time.Now().Before(entry.expires) {
++		report := entry.report
++		c.mu.Unlock()
++		return report, nil
++	}
++	if existing, ok := c.inflight[key]; ok {
++		c.mu.Unlock()
++		select {
++		case <-existing.done:
++			return existing.report, existing.err
++		case <-ctx.Done():
++			// This caller gave up; the shared evaluation continues for the
++			// others rather than being cancelled out from under them.
++			return Report{}, ctx.Err()
++		}
++	}
++	f := &flight{done: make(chan struct{})}
++	c.inflight[key] = f
++	c.mu.Unlock()
++
++	// The evaluation deliberately does not inherit this caller's context: it is
++	// shared, so one client disconnecting must not cancel the work the others
++	// are waiting on. Timeouts come from the Prometheus client instead.
++	f.report, f.err = evaluate(context.WithoutCancel(ctx))
++	close(f.done)
++
++	c.mu.Lock()
++	delete(c.inflight, key)
++	if f.err == nil {
++		c.evictLocked()
++		c.entries[key] = &cacheEntry{report: f.report, expires: time.Now().Add(c.ttl)}
++	}
++	c.mu.Unlock()
++
++	return f.report, f.err
++}
++
++// evictLocked keeps the map bounded. Expired entries go first; if that is not
++// enough, the soonest-to-expire entries are dropped. The key space is
++// (workloads × windows), so this is a guard against an unbounded cluster rather
++// than a hot-path concern.
++func (c *reportCache) evictLocked() {
++	if len(c.entries) < c.maxEntries {
++		return
++	}
++	now := time.Now()
++	for key, entry := range c.entries {
++		if now.After(entry.expires) {
++			delete(c.entries, key)
++		}
++	}
++	for len(c.entries) >= c.maxEntries {
++		var oldestKey string
++		var oldest time.Time
++		for key, entry := range c.entries {
++			if oldestKey == "" || entry.expires.Before(oldest) {
++				oldestKey, oldest = key, entry.expires
++			}
++		}
++		if oldestKey == "" {
++			return
++		}
++		delete(c.entries, oldestKey)
++	}
++}
+diff --git a/internal/servicehealth/service.go b/internal/servicehealth/service.go
+index 9d1e72d..dcc30fc 100644
+--- a/internal/servicehealth/service.go
++++ b/internal/servicehealth/service.go
+@@ -1,5 +1,12 @@
+ // Package servicehealth defines Beholdr-owned PromQL queries and turns their
+ // results into bounded, per-service health signals for the API and UI.
++//
++// Two evaluations back every signal. The chart comes from a range query over
++// the operator's selected window; the score comes from an instant query at
++// "now". They are deliberately separate: a range query's last point is only as
++// fresh as that range's step, so scoring from it would make a service's
++// severity depend on which chart window happened to be selected — a spike in
++// the last ten minutes would be invisible on the 21-day view.
+ package servicehealth
+ 
+ import (
+@@ -10,6 +17,7 @@ import (
+ 	"regexp"
+ 	"sort"
+ 	"strconv"
++	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -17,10 +25,27 @@ import (
+ 	"github.com/delangetimm/beholdr/internal/integrations"
+ )
+ 
+-type RangeQuerier interface {
++// Querier is the Prometheus surface this package consumes. Beholdr owns every
++// query template; nothing here is ever built from an HTTP request body.
++type Querier interface {
+ 	QueryPrometheusRange(context.Context, string, time.Time, time.Time, time.Duration) ([]integrations.TimeSeries, error)
++	QueryPrometheusInstant(context.Context, string, time.Time) ([]integrations.InstantSample, error)
+ }
+ 
++// CPUBasis selects what container CPU usage is compared against.
++type CPUBasis string
++
++const (
++	// CPUBasisLimits scores CPU against the container's CPU limit, where
++	// exceeding the value means throttling. This is the default because it is
++	// the only basis on which a percentage over 100 is actually a problem.
++	CPUBasisLimits CPUBasis = "limits"
++	// CPUBasisRequests scores CPU against requests. Requests are a scheduling
++	// floor, not a ceiling — healthy bursty services routinely run at several
++	// hundred percent of request — so thresholds must be set accordingly.
++	CPUBasisRequests CPUBasis = "requests"
++)
++
+ type Config struct {
+ 	HTTPRequestsMetric string
+ 	HTTPErrorsMetric   string
+@@ -30,7 +55,14 @@ type Config struct {
+ 	AppPodLabel        string
+ 	KubeNamespaceLabel string
+ 	KubePodLabel       string
++	CPUBasis           CPUBasis
+ 	Thresholds         Thresholds
++	// CacheTTL is how long a completed report is reused. Zero selects the
++	// default; negative disables caching.
++	CacheTTL time.Duration
++	// MaxConcurrentQueries bounds how many Prometheus queries this process has
++	// in flight at once, across all callers.
++	MaxConcurrentQueries int
+ }
+ 
+ type Thresholds struct {
+@@ -52,6 +84,15 @@ type Window struct {
+ 	Step     time.Duration
+ }
+ 
++// comparisonOffset is how far back the "week before" overlay reaches.
++const comparisonOffset = 7 * 24 * time.Hour
++
++// Comparable reports whether a week-before overlay is meaningful for this
++// window. Beyond one week the offset series overlaps the current series — the
++// same wall-clock samples drawn twice — which is a comparison in appearance
++// only, so it is suppressed rather than shown.
++func (w Window) Comparable() bool { return w.Duration <= comparisonOffset }
++
+ var windows = map[string]Window{
+ 	"1h":  {Name: "1h", Duration: time.Hour, Step: 15 * time.Second},
+ 	"6h":  {Name: "6h", Duration: 6 * time.Hour, Step: time.Minute},
+@@ -62,9 +103,17 @@ var windows = map[string]Window{
+ 
+ var promIdentifier = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
+ 
++const (
++	defaultCacheTTL             = 30 * time.Second
++	defaultMaxConcurrentQueries = 6
++	maxCacheEntries             = 512
++)
++
+ type Service struct {
+-	query RangeQuerier
++	query Querier
+ 	cfg   Config
++	cache *reportCache
++	sem   chan struct{}
+ }
+ 
+ type Severity string
+@@ -76,6 +125,20 @@ const (
+ 	SeverityCritical Severity = "critical"
+ )
+ 
++// State separates "this signal was measured" from the two ways it can be
++// absent. The distinction matters for the aggregate: a query that failed is a
++// gap in Beholdr's knowledge and must not read as green, but a metric that
++// simply does not exist for this workload — no memory limit configured, no HTTP
++// traffic — says nothing about the service's health and must not drag every
++// other signal down with it.
++type State string
++
++const (
++	StateOK     State = "ok"
++	StateNoData State = "no_data"
++	StateError  State = "error"
++)
++
+ type Point map[string]float64
+ 
+ type Line struct {
+@@ -92,12 +155,15 @@ type Signal struct {
+ 	Current     *float64 `json:"current,omitempty"`
+ 	Previous    *float64 `json:"previous,omitempty"`
+ 	Difference  *float64 `json:"difference,omitempty"`
+-	Warning     float64  `json:"warning"`
+-	Critical    float64  `json:"critical"`
+-	Severity    Severity `json:"severity"`
+-	Lines       []Line   `json:"lines"`
+-	Points      []Point  `json:"points"`
+-	Error       string   `json:"error,omitempty"`
++	// Warning is omitted when there is no meaningful warning band — a
++	// single-replica service, where one failing pod is already critical.
++	Warning  *float64 `json:"warning,omitempty"`
++	Critical float64  `json:"critical"`
++	Severity Severity `json:"severity"`
++	State    State    `json:"state"`
++	Lines    []Line   `json:"lines"`
++	Points   []Point  `json:"points"`
++	Error    string   `json:"error,omitempty"`
+ }
+ 
+ type Report struct {
+@@ -109,6 +175,10 @@ type Report struct {
+ 	Step      float64  `json:"step"`
+ 	Severity  Severity `json:"severity"`
+ 	Signals   []Signal `json:"signals"`
++	// Compared reports whether the week-before overlay was evaluated for this
++	// window, so the UI can explain its absence rather than silently omitting a
++	// line the legend promises.
++	Compared bool `json:"compared"`
+ }
+ 
+ func DefaultConfig() Config {
+@@ -121,6 +191,7 @@ func DefaultConfig() Config {
+ 		AppPodLabel:        "kubernetes_pod_name",
+ 		KubeNamespaceLabel: "namespace",
+ 		KubePodLabel:       "pod",
++		CPUBasis:           CPUBasisLimits,
+ 		Thresholds: Thresholds{
+ 			ErrorRateWarning:      1,
+ 			ErrorRateCritical:     5,
+@@ -136,18 +207,67 @@ func DefaultConfig() Config {
+ 	}
+ }
+ 
+-func New(query RangeQuerier, cfg Config) *Service {
++// New validates cfg and builds the service. Unset fields take the defaults;
++// values that are present but unusable are an error rather than a silent
++// substitution, because quietly replacing a bad threshold can invert a pair
++// (warning 10 / critical 5) and quietly replacing a bad metric name sends every
++// query at a metric the operator never chose.
++func New(query Querier, cfg Config) (*Service, error) {
+ 	defaults := DefaultConfig()
+-	cfg.HTTPRequestsMetric = identifierOr(cfg.HTTPRequestsMetric, defaults.HTTPRequestsMetric)
+-	cfg.HTTPErrorsMetric = identifierOr(cfg.HTTPErrorsMetric, defaults.HTTPErrorsMetric)
+-	cfg.HTTPStatusLabel = optionalIdentifier(cfg.HTTPStatusLabel, defaults.HTTPStatusLabel)
+-	cfg.AppNamespaceLabel = identifierOr(cfg.AppNamespaceLabel, defaults.AppNamespaceLabel)
+-	cfg.AppServiceLabel = optionalIdentifier(cfg.AppServiceLabel, defaults.AppServiceLabel)
+-	cfg.AppPodLabel = identifierOr(cfg.AppPodLabel, defaults.AppPodLabel)
+-	cfg.KubeNamespaceLabel = identifierOr(cfg.KubeNamespaceLabel, defaults.KubeNamespaceLabel)
+-	cfg.KubePodLabel = identifierOr(cfg.KubePodLabel, defaults.KubePodLabel)
+-	cfg.Thresholds = thresholdsOr(cfg.Thresholds, defaults.Thresholds)
+-	return &Service{query: query, cfg: cfg}
++	var err error
++	if cfg.HTTPRequestsMetric, err = identifier("http requests metric", cfg.HTTPRequestsMetric, defaults.HTTPRequestsMetric, false); err != nil {
++		return nil, err
++	}
++	if cfg.HTTPErrorsMetric, err = identifier("http errors metric", cfg.HTTPErrorsMetric, defaults.HTTPErrorsMetric, true); err != nil {
++		return nil, err
++	}
++	if cfg.HTTPStatusLabel, err = identifier("http status label", cfg.HTTPStatusLabel, defaults.HTTPStatusLabel, true); err != nil {
++		return nil, err
++	}
++	if cfg.AppNamespaceLabel, err = identifier("app namespace label", cfg.AppNamespaceLabel, defaults.AppNamespaceLabel, false); err != nil {
++		return nil, err
++	}
++	if cfg.AppServiceLabel, err = identifier("app service label", cfg.AppServiceLabel, defaults.AppServiceLabel, true); err != nil {
++		return nil, err
++	}
++	if cfg.AppPodLabel, err = identifier("app pod label", cfg.AppPodLabel, defaults.AppPodLabel, false); err != nil {
++		return nil, err
++	}
++	if cfg.KubeNamespaceLabel, err = identifier("kube namespace label", cfg.KubeNamespaceLabel, defaults.KubeNamespaceLabel, false); err != nil {
++		return nil, err
++	}
++	if cfg.KubePodLabel, err = identifier("kube pod label", cfg.KubePodLabel, defaults.KubePodLabel, false); err != nil {
++		return nil, err
++	}
++	switch cfg.CPUBasis {
++	case "":
++		cfg.CPUBasis = defaults.CPUBasis
++	case CPUBasisLimits, CPUBasisRequests:
++	default:
++		return nil, fmt.Errorf("service health: cpu basis must be %q or %q, got %q", CPUBasisLimits, CPUBasisRequests, cfg.CPUBasis)
++	}
++	if cfg.Thresholds, err = validateThresholds(cfg.Thresholds, defaults.Thresholds); err != nil {
++		return nil, err
++	}
++	if cfg.HTTPErrorsMetric != "" && cfg.HTTPStatusLabel == "" {
++		// Fine: an explicit error metric does not need a status filter.
++		_ = cfg.HTTPStatusLabel
++	}
++	if cfg.HTTPErrorsMetric == "" && cfg.HTTPStatusLabel == "" {
++		return nil, errors.New("service health: either an http errors metric or an http status label is required")
++	}
++	if cfg.CacheTTL == 0 {
++		cfg.CacheTTL = defaultCacheTTL
++	}
++	if cfg.MaxConcurrentQueries <= 0 {
++		cfg.MaxConcurrentQueries = defaultMaxConcurrentQueries
++	}
++	return &Service{
++		query: query,
++		cfg:   cfg,
++		cache: newReportCache(cfg.CacheTTL, maxCacheEntries),
++		sem:   make(chan struct{}, cfg.MaxConcurrentQueries),
++	}, nil
+ }
+ 
+ func ParseWindow(value string) (Window, bool) {
+@@ -158,31 +278,55 @@ func ParseWindow(value string) (Window, bool) {
+ 	return w, ok
+ }
+ 
+-func (s *Service) Query(ctx context.Context, workload collect.Microservice, window Window, end time.Time) (Report, error) {
++// Query returns the report for one workload and window. Identical concurrent
++// requests share a single evaluation and completed reports are reused for
++// CacheTTL: the UI polls this endpoint per open tab, Beholdr has no
++// authentication of its own, and every uncached call is ten-plus range and
++// instant queries against the same Prometheus an operator is depending on
++// during an incident.
++func (s *Service) Query(ctx context.Context, workload collect.Microservice, podNames []string, window Window, end time.Time) (Report, error) {
++	key := workload.Namespace + "/" + workload.Name + "@" + window.Name
++	return s.cache.do(ctx, key, func(ctx context.Context) (Report, error) {
++		return s.evaluate(ctx, workload, podNames, window, end)
++	})
++}
++
++func (s *Service) evaluate(ctx context.Context, workload collect.Microservice, podNames []string, window Window, end time.Time) (Report, error) {
+ 	if s.query == nil {
+ 		return Report{}, integrations.ErrPrometheusNotConfigured
+ 	}
+ 	start := end.Add(-window.Duration)
+-	queries := s.queries(workload)
+-	results := make(map[string][]integrations.TimeSeries, len(queries))
+-	errs := make(map[string]error, len(queries))
++	queries := s.queries(workload, window)
++	scoring := s.scoringQueries(workload, podNames, window)
++
++	results := make(map[string]queryOutcome, len(queries))
+ 	var mu sync.Mutex
+ 	var wg sync.WaitGroup
+ 	for key, query := range queries {
+ 		wg.Add(1)
+-		go func() {
++		go func(key, query string) {
+ 			defer wg.Done()
+-			series, err := s.query.QueryPrometheusRange(ctx, query, start, end, window.Step)
++			var got queryOutcome
++			// The chart and the score are two evaluations of the same
++			// template. A failure of either marks the signal as errored.
++			got.series, got.err = s.runRange(ctx, query, start, end, window.Step)
++			if value, err := s.runInstant(ctx, scoring[key], end); err != nil {
++				if got.err == nil {
++					got.err = err
++				}
++			} else {
++				got.instant = value
++			}
+ 			mu.Lock()
+-			results[key], errs[key] = series, err
++			results[key] = got
+ 			mu.Unlock()
+-		}()
++		}(key, query)
+ 	}
+ 	wg.Wait()
+ 
+-	for _, err := range errs {
+-		if errors.Is(err, integrations.ErrPrometheusNotConfigured) {
+-			return Report{}, err
++	for _, got := range results {
++		if errors.Is(got.err, integrations.ErrPrometheusNotConfigured) {
++			return Report{}, got.err
+ 		}
+ 	}
+ 
+@@ -193,22 +337,115 @@ func (s *Service) Query(ctx context.Context, workload collect.Microservice, wind
+ 		Start:     unixSeconds(start),
+ 		End:       unixSeconds(end),
+ 		Step:      window.Step.Seconds(),
+-		Severity:  SeverityHealthy,
++		Compared:  window.Comparable(),
+ 	}
+ 	report.Signals = []Signal{
+-		s.errorSignal(results["errors"], results["errors_previous"], errs["errors"], errs["errors_previous"]),
+-		s.simpleSignal("cpu", "CPU usage", "% of requests", "Container CPU usage divided by configured CPU requests.", s.cfg.Thresholds.CPUWarning, s.cfg.Thresholds.CPUCritical, results["cpu"], errs["cpu"], "current", "CPU", "#818cf8"),
+-		s.simpleSignal("memory", "Memory usage", "% of limits", "Container working set divided by configured memory limits.", s.cfg.Thresholds.MemoryWarning, s.cfg.Thresholds.MemoryCritical, results["memory"], errs["memory"], "current", "Memory", "#10b981"),
+-		s.failingPodsSignal(workload.DesiredReplica, results["waiting"], results["failed_phase"], errs["waiting"], errs["failed_phase"]),
++		s.errorSignal(results["errors"], results["errors_previous"], window.Comparable()),
++		s.simpleSignal(signalSpec{
++			key: "cpu", label: "CPU usage", unit: s.cpuUnit(), description: s.cpuDescription(),
++			warning: s.cfg.Thresholds.CPUWarning, critical: s.cfg.Thresholds.CPUCritical,
++			lineKey: "current", lineLabel: "CPU", color: "#818cf8",
++		}, results["cpu"]),
++		s.simpleSignal(signalSpec{
++			key: "memory", label: "Memory usage", unit: "% of limits",
++			description: "Container working set divided by configured memory limits.",
++			warning:     s.cfg.Thresholds.MemoryWarning, critical: s.cfg.Thresholds.MemoryCritical,
++			lineKey: "current", lineLabel: "Memory", color: "#10b981",
++		}, results["memory"]),
++		s.failingPodsSignal(workload.DesiredReplica, results["waiting"], results["failed_phase"]),
++	}
++	report.Severity = aggregate(report.Signals)
++	return report, nil
++}
++
++// runRange and runInstant hold the shared semaphore for the duration of one
++// Prometheus call, so a burst of requests queues instead of multiplying.
++func (s *Service) runRange(ctx context.Context, query string, start, end time.Time, step time.Duration) ([]integrations.TimeSeries, error) {
++	select {
++	case s.sem <- struct{}{}:
++		defer func() { <-s.sem }()
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++	return s.query.QueryPrometheusRange(ctx, query, start, end, step)
++}
++
++func (s *Service) runInstant(ctx context.Context, query string, at time.Time) (*float64, error) {
++	select {
++	case s.sem <- struct{}{}:
++		defer func() { <-s.sem }()
++	case <-ctx.Done():
++		return nil, ctx.Err()
+ 	}
+-	for _, signal := range report.Signals {
+-		report.Severity = maxSeverity(report.Severity, signal.Severity)
++	samples, err := s.query.QueryPrometheusInstant(ctx, query, at)
++	if err != nil {
++		return nil, err
+ 	}
+-	return report, nil
++	if len(samples) == 0 {
++		return nil, nil
++	}
++	if len(samples) > 1 {
++		// Every template here aggregates to a single series. More than one
++		// means the query no longer matches its contract, and silently taking
++		// the first would report a confident wrong number.
++		return nil, fmt.Errorf("service health: expected one series, got %d", len(samples))
++	}
++	value := samples[0].Sample.Value
++	return &value, nil
+ }
+ 
+-func (s *Service) queries(workload collect.Microservice) map[string]string {
+-	podRegex := workloadPodRegex(workload.Kind, workload.Name)
++func (s *Service) cpuUnit() string {
++	if s.cfg.CPUBasis == CPUBasisRequests {
++		return "% of requests"
++	}
++	return "% of limits"
++}
++
++func (s *Service) cpuDescription() string {
++	if s.cfg.CPUBasis == CPUBasisRequests {
++		return "Container CPU usage divided by configured CPU requests. Requests are a scheduling floor, not a ceiling — values above 100% are normal for bursty services."
++	}
++	return "Container CPU usage divided by configured CPU limits. Sustained values near 100% mean the container is being throttled."
++}
++
++// queries builds the chart (range) templates, which select pods by name shape
++// so that pods replaced by earlier rollouts stay in the history.
++func (s *Service) queries(workload collect.Microservice, window Window) map[string]string {
++	return s.buildQueries(workload, window, workloadPodRegex(workload.Kind, workload.Name))
++}
++
++// scoringQueries builds the templates the severity is computed from. When the
++// collector knows which pods the workload currently has, they are matched
++// exactly: name-shape matching cannot always separate a workload called "api"
++// from one called "api-gateway", and a badge that alerts on another service's
++// pods is worse than a chart that does. Falls back to the shape when the
++// workload has no pods right now.
++func (s *Service) scoringQueries(workload collect.Microservice, podNames []string, window Window) map[string]string {
++	selector := exactPodRegex(podNames)
++	if selector == "" {
++		selector = workloadPodRegex(workload.Kind, workload.Name)
++	}
++	return s.buildQueries(workload, window, selector)
++}
++
++func exactPodRegex(names []string) string {
++	if len(names) == 0 {
++		return ""
++	}
++	quoted := make([]string, 0, len(names))
++	for _, name := range names {
++		if name != "" {
++			quoted = append(quoted, regexp.QuoteMeta(name))
++		}
++	}
++	if len(quoted) == 0 {
++		return ""
++	}
++	sort.Strings(quoted)
++	return "^(" + strings.Join(quoted, "|") + ")$"
++}
++
++func (s *Service) buildQueries(workload collect.Microservice, window Window, podRegex string) map[string]string {
+ 	appScope := matcher(s.cfg.AppNamespaceLabel, "=", workload.Namespace)
+ 	if s.cfg.AppServiceLabel != "" {
+ 		appScope += "," + matcher(s.cfg.AppServiceLabel, "=", workload.Name)
+@@ -230,12 +467,16 @@ func (s *Service) queries(workload collect.Microservice) map[string]string {
+ 		return fmt.Sprintf("100 * sum(%s) / clamp_min(sum(%s), 0.000001)", rate(errorMetric, errorScope, offset), rate(s.cfg.HTTPRequestsMetric, appScope, offset))
+ 	}
+ 
+-	return map[string]string{
+-		"errors":          errorRate(""),
+-		"errors_previous": errorRate(" offset 1w"),
++	cpuDenominator := "kube_pod_container_resource_limits"
++	if s.cfg.CPUBasis == CPUBasisRequests {
++		cpuDenominator = "kube_pod_container_resource_requests"
++	}
++
++	out := map[string]string{
++		"errors": errorRate(""),
+ 		"cpu": fmt.Sprintf(
+-			`100 * sum(rate(container_cpu_usage_seconds_total{%s,container!="",container!="POD"}[5m])) / clamp_min(sum(kube_pod_container_resource_requests{%s,container!="",resource="cpu",unit="core"} > 0), 0.001)`,
+-			kubeScope, kubeScope,
++			`100 * sum(rate(container_cpu_usage_seconds_total{%s,container!="",container!="POD"}[5m])) / clamp_min(sum(%s{%s,container!="",resource="cpu",unit="core"} > 0), 0.001)`,
++			kubeScope, cpuDenominator, kubeScope,
+ 		),
+ 		"memory": fmt.Sprintf(
+ 			`100 * sum(container_memory_working_set_bytes{%s,container!="",container!="POD"}) / clamp_min(sum(kube_pod_container_resource_limits{%s,container!="",resource="memory",unit="byte"} > 0), 1)`,
+@@ -245,34 +486,58 @@ func (s *Service) queries(workload collect.Microservice) map[string]string {
+ 			`(sum(max by (%s,%s) (kube_pod_container_status_waiting_reason{%s,reason=~"CrashLoopBackOff|ImagePullBackOff|ErrImagePull|CreateContainerConfigError"} == 1)) or 0 * count(kube_pod_info{%s}))`,
+ 			s.cfg.KubeNamespaceLabel, s.cfg.KubePodLabel, kubeScope, kubeScope,
+ 		),
++		// Job pods are excluded: a Pod that failed weeks ago keeps reporting
++		// phase="Failed" for as long as the object exists, so counting them
++		// would pin a namespace to critical until someone reaped it by hand.
+ 		"failed_phase": fmt.Sprintf(
+-			`(sum(kube_pod_status_phase{%s,phase=~"Failed|Unknown"} == 1) or 0 * count(kube_pod_info{%s}))`,
+-			kubeScope, kubeScope,
++			`(sum(kube_pod_status_phase{%s,phase=~"Failed|Unknown"} == 1 unless on (%s,%s) kube_pod_owner{%s,owner_kind="Job"}) or 0 * count(kube_pod_info{%s}))`,
++			kubeScope, s.cfg.KubeNamespaceLabel, s.cfg.KubePodLabel, kubeScope, kubeScope,
+ 		),
+ 	}
++	if window.Comparable() {
++		out["errors_previous"] = errorRate(" offset 1w")
++	}
++	return out
+ }
+ 
+-func (s *Service) errorSignal(currentSeries, previousSeries []integrations.TimeSeries, currentErr, previousErr error) Signal {
++type signalSpec struct {
++	key, label, unit, description string
++	warning, critical             float64
++	lineKey, lineLabel, color     string
++}
++
++func (s *Service) errorSignal(current, previous queryOutcome, compared bool) Signal {
+ 	t := s.cfg.Thresholds
++	warning := t.ErrorRateWarning
++	lines := []Line{{Key: "current", Label: "Current", Color: "#f43f5e"}}
++	series := map[string][]integrations.TimeSeries{"current": current.series}
++	if compared {
++		lines = append(lines, Line{Key: "week_ago", Label: "Week before", Color: "#64748b"})
++		series["week_ago"] = previous.series
++	}
+ 	signal := Signal{
+ 		Key: "error_rate", Label: "HTTP error rate", Unit: "%",
+-		Description: "HTTP 5xx responses as a percentage of all requests, compared with the same time one week earlier.",
+-		Warning:     t.ErrorRateWarning, Critical: t.ErrorRateCritical, Severity: SeverityUnknown,
+-		Lines:  []Line{{Key: "current", Label: "Current", Color: "#f43f5e"}, {Key: "week_ago", Label: "Week before", Color: "#64748b"}},
+-		Points: mergeSeries(map[string][]integrations.TimeSeries{"current": currentSeries, "week_ago": previousSeries}),
+-	}
+-	if currentErr != nil {
+-		signal.Error = "Prometheus query failed"
++		Description: s.errorDescription(compared),
++		Warning:     &warning, Critical: t.ErrorRateCritical,
++		Severity: SeverityUnknown, State: StateError,
++		Lines:  lines,
++		Points: mergeSeries(series),
++	}
++	if current.err != nil {
++		signal.Error = queryErrorMessage(current.err)
+ 		return signal
+ 	}
+-	signal.Current = lastValue(currentSeries)
+-	signal.Previous = lastValue(previousSeries)
++	signal.Current = current.instant
++	if compared && previous.err == nil {
++		signal.Previous = previous.instant
++	}
+ 	if signal.Current == nil {
+-		signal.Error = "No matching HTTP request metric"
++		signal.State, signal.Error = StateNoData, "No matching HTTP request metric"
+ 		return signal
+ 	}
++	signal.State = StateOK
+ 	signal.Severity = thresholdSeverity(*signal.Current, t.ErrorRateWarning, t.ErrorRateCritical)
+-	if previousErr == nil && signal.Previous != nil {
++	if signal.Previous != nil {
+ 		difference := *signal.Current - *signal.Previous
+ 		signal.Difference = &difference
+ 		if difference > 0 {
+@@ -282,55 +547,130 @@ func (s *Service) errorSignal(currentSeries, previousSeries []integrations.TimeS
+ 	return signal
+ }
+ 
+-func (s *Service) simpleSignal(key, label, unit, description string, warning, critical float64, series []integrations.TimeSeries, queryErr error, lineKey, lineLabel, color string) Signal {
+-	signal := Signal{
+-		Key: key, Label: label, Unit: unit, Description: description,
+-		Warning: warning, Critical: critical, Severity: SeverityUnknown,
+-		Lines:  []Line{{Key: lineKey, Label: lineLabel, Color: color}},
+-		Points: mergeSeries(map[string][]integrations.TimeSeries{lineKey: series}),
++func (s *Service) errorDescription(compared bool) string {
++	base := "HTTP 5xx responses as a percentage of all requests"
++	if compared {
++		return base + ", compared with the same time one week earlier."
+ 	}
+-	if queryErr != nil {
+-		signal.Error = "Prometheus query failed"
++	return base + ". The week-before overlay is not shown on windows longer than seven days, where it would overlap the current series."
++}
++
++func (s *Service) simpleSignal(spec signalSpec, got queryOutcome) Signal {
++	warning := spec.warning
++	signal := Signal{
++		Key: spec.key, Label: spec.label, Unit: spec.unit, Description: spec.description,
++		Warning: &warning, Critical: spec.critical,
++		Severity: SeverityUnknown, State: StateError,
++		Lines:  []Line{{Key: spec.lineKey, Label: spec.lineLabel, Color: spec.color}},
++		Points: mergeSeries(map[string][]integrations.TimeSeries{spec.lineKey: got.series}),
++	}
++	if got.err != nil {
++		signal.Error = queryErrorMessage(got.err)
+ 		return signal
+ 	}
+-	signal.Current = lastValue(series)
++	signal.Current = got.instant
+ 	if signal.Current == nil {
+-		signal.Error = "No matching metric"
++		signal.State, signal.Error = StateNoData, "No matching metric for this workload"
+ 		return signal
+ 	}
+-	signal.Severity = thresholdSeverity(*signal.Current, warning, critical)
++	signal.State = StateOK
++	signal.Severity = thresholdSeverity(*signal.Current, spec.warning, spec.critical)
+ 	return signal
+ }
+ 
+-func (s *Service) failingPodsSignal(desired int32, waiting, failed []integrations.TimeSeries, waitingErr, failedErr error) Signal {
++func (s *Service) failingPodsSignal(desired int32, waiting, failed queryOutcome) Signal {
+ 	t := s.cfg.Thresholds
+ 	warning := math.Max(t.FailingPodsWarning, math.Ceil(float64(desired)*0.10))
+ 	critical := math.Max(t.FailingPodsCritical, math.Ceil(float64(desired)*0.25))
++	warningPtr := &warning
+ 	if desired <= 1 {
++		// One failing pod is the whole service. There is no band between
++		// "degraded" and "down", so no warning threshold is reported rather
++		// than reporting one equal to critical.
+ 		critical = 1
++		warningPtr = nil
+ 	}
+ 	signal := Signal{
+ 		Key: "failing_pods", Label: "Failing pods", Unit: "pods",
+-		Description: "Pods in failed/unknown phases or containers blocked by crash and image/config errors.",
+-		Warning:     warning, Critical: critical, Severity: SeverityUnknown,
++		Description: "Pods in Failed/Unknown phase (excluding Job pods) plus containers blocked by crash and image/config errors.",
++		Warning:     warningPtr, Critical: critical,
++		Severity: SeverityUnknown, State: StateError,
+ 		Lines:  []Line{{Key: "current", Label: "Failing pods", Color: "#f59e0b"}},
+-		Points: sumSeries("current", waiting, failed),
++		Points: sumSeries("current", waiting.series, failed.series),
+ 	}
+-	if waitingErr != nil && failedErr != nil {
+-		signal.Error = "Prometheus query failed"
++	if waiting.err != nil && failed.err != nil {
++		signal.Error = queryErrorMessage(waiting.err)
+ 		return signal
+ 	}
+-	w, f := lastValue(waiting), lastValue(failed)
+-	if w == nil && f == nil {
+-		signal.Error = "No matching pod-state metrics"
++	if waiting.instant == nil && failed.instant == nil {
++		signal.State, signal.Error = StateNoData, "No matching pod-state metrics"
+ 		return signal
+ 	}
+-	value := valueOrZero(w) + valueOrZero(f)
++	value := valueOrZero(waiting.instant) + valueOrZero(failed.instant)
+ 	signal.Current = &value
+-	signal.Severity = thresholdSeverity(value, warning, critical)
++	signal.State = StateOK
++	warningValue := critical
++	if warningPtr != nil {
++		warningValue = *warningPtr
++	}
++	signal.Severity = thresholdSeverity(value, warningValue, critical)
+ 	return signal
+ }
+ 
++// queryOutcome is the per-query result carried from evaluate into the signal
++// builders. It exists so the builders take one value rather than three
++// positional arguments that are easy to transpose.
++type queryOutcome struct {
++	series  []integrations.TimeSeries
++	instant *float64
++	err     error
++}
++
++// aggregate rolls the signals up. Signals that could not be measured (no such
++// metric for this workload) are skipped, because a service without a memory
++// limit is not thereby in an unknown state. Signals whose query failed do
++// count as unknown: that is a gap in what Beholdr knows, and it outranks
++// healthy so one broken query cannot paint a service green.
++func aggregate(signals []Signal) Severity {
++	worst := SeverityHealthy
++	measured := false
++	for _, signal := range signals {
++		switch signal.State {
++		case StateOK:
++			measured = true
++			worst = maxSeverity(worst, signal.Severity)
++		case StateError:
++			measured = true
++			worst = maxSeverity(worst, SeverityUnknown)
++		case StateNoData:
++			// deliberately ignored
++		}
++	}
++	if !measured {
++		return SeverityUnknown
++	}
++	return worst
++}
++
++// queryErrorMessage maps a query failure onto the same closed vocabulary the
++// connectivity checks use. Nothing derived from an upstream response body ever
++// reaches this string.
++func queryErrorMessage(err error) string {
++	switch {
++	case errors.Is(err, integrations.ErrPrometheusQueryRejected):
++		return "Prometheus rejected the query — check the configured metric and label names"
++	case errors.Is(err, integrations.ErrPrometheusUnauthorized):
++		return "Prometheus rejected Beholdr's credentials"
++	case errors.Is(err, integrations.ErrPrometheusTimeout):
++		return "Prometheus query timed out — try a shorter range"
++	case errors.Is(err, integrations.ErrPrometheusUnavailable):
++		return "Prometheus is unavailable"
++	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
++		return "Query cancelled"
++	}
++	return "Prometheus query failed"
++}
++
+ func mergeSeries(series map[string][]integrations.TimeSeries) []Point {
+ 	byTime := map[float64]Point{}
+ 	for key, all := range series {
+@@ -380,81 +720,86 @@ func sortedPoints(byTime map[float64]Point) []Point {
+ 	return points
+ }
+ 
+-func lastValue(series []integrations.TimeSeries) *float64 {
+-	if len(series) == 0 || len(series[0].Values) == 0 {
+-		return nil
+-	}
+-	value := series[0].Values[len(series[0].Values)-1].Value
+-	return &value
+-}
+-
+ func matcher(label, operator, value string) string {
+ 	return label + operator + strconv.Quote(value)
+ }
+ 
++// workloadPodRegex matches the pods of one workload by name shape. It is
++// anchored and segment-counted so that a workload named "api" can never match
++// the pods of "api-gateway": every alternative fixes the number of "-"
++// separated segments after the workload name.
++//
++// The collector currently reports only "Deployment" and "Other", so the
++// default branch has to cover StatefulSets, DaemonSets and Jobs — it is a union
++// of the known shapes rather than a wildcard, which is what made the previous
++// "^name(-.+)?$" absorb sibling services' metrics.
++//
++// One ambiguity is irreducible: pod "api-gateway-abcde" is a valid pod name for
++// both a DaemonSet called "api-gateway" and a Deployment called "api". Scoring
++// therefore prefers the exact current pod names (see scoringQueries); only the
++// historical chart can still be affected.
+ func workloadPodRegex(kind, name string) string {
+ 	name = regexp.QuoteMeta(name)
++	deployment := "^" + name + "-[a-z0-9]+-[a-z0-9]{5}$"
++	statefulSet := "^" + name + "-[0-9]+$"
++	daemonSet := "^" + name + "-[a-z0-9]{5}$"
+ 	switch kind {
+ 	case "Deployment":
+-		return "^" + name + "-[a-z0-9]{8,10}-[a-z0-9]{5}$"
++		return deployment
+ 	case "StatefulSet":
+-		return "^" + name + "-[0-9]+$"
++		return statefulSet
+ 	case "DaemonSet":
+-		return "^" + name + "-[a-z0-9]{5}$"
++		return daemonSet
+ 	default:
+-		return "^" + name + "(-.+)?$"
++		return strings.Join([]string{deployment, statefulSet, daemonSet}, "|")
+ 	}
+ }
+ 
+-func identifierOr(value, fallback string) string {
+-	if promIdentifier.MatchString(value) {
+-		return value
+-	}
+-	return fallback
+-}
+-
+-func optionalIdentifier(value, fallback string) string {
++func identifier(field, value, fallback string, optional bool) (string, error) {
++	value = strings.TrimSpace(value)
+ 	if value == "" {
+-		return fallback
++		if optional {
++			return fallback, nil
++		}
++		if fallback == "" {
++			return "", fmt.Errorf("service health: %s is required", field)
++		}
++		return fallback, nil
+ 	}
+-	if promIdentifier.MatchString(value) {
+-		return value
++	if !promIdentifier.MatchString(value) {
++		return "", fmt.Errorf("service health: %s %q is not a valid Prometheus identifier", field, value)
+ 	}
+-	return fallback
++	return value, nil
+ }
+ 
+-func thresholdsOr(value, fallback Thresholds) Thresholds {
+-	if value.ErrorRateWarning <= 0 {
+-		value.ErrorRateWarning = fallback.ErrorRateWarning
+-	}
+-	if value.ErrorRateCritical <= value.ErrorRateWarning {
+-		value.ErrorRateCritical = fallback.ErrorRateCritical
+-	}
+-	if value.ErrorIncreaseWarning <= 0 {
+-		value.ErrorIncreaseWarning = fallback.ErrorIncreaseWarning
+-	}
+-	if value.ErrorIncreaseCritical <= value.ErrorIncreaseWarning {
+-		value.ErrorIncreaseCritical = fallback.ErrorIncreaseCritical
+-	}
+-	if value.CPUWarning <= 0 {
+-		value.CPUWarning = fallback.CPUWarning
+-	}
+-	if value.CPUCritical <= value.CPUWarning {
+-		value.CPUCritical = fallback.CPUCritical
+-	}
+-	if value.MemoryWarning <= 0 {
+-		value.MemoryWarning = fallback.MemoryWarning
+-	}
+-	if value.MemoryCritical <= value.MemoryWarning {
+-		value.MemoryCritical = fallback.MemoryCritical
+-	}
+-	if value.FailingPodsWarning <= 0 {
+-		value.FailingPodsWarning = fallback.FailingPodsWarning
+-	}
+-	if value.FailingPodsCritical <= value.FailingPodsWarning {
+-		value.FailingPodsCritical = fallback.FailingPodsCritical
++func validateThresholds(value, fallback Thresholds) (Thresholds, error) {
++	pairs := []struct {
++		name                       string
++		warning, critical          *float64
++		fbWarning, fbCritical      float64
++		allowWarningEqualsCritical bool
++	}{
++		{"error rate", &value.ErrorRateWarning, &value.ErrorRateCritical, fallback.ErrorRateWarning, fallback.ErrorRateCritical, false},
++		{"error increase", &value.ErrorIncreaseWarning, &value.ErrorIncreaseCritical, fallback.ErrorIncreaseWarning, fallback.ErrorIncreaseCritical, false},
++		{"cpu", &value.CPUWarning, &value.CPUCritical, fallback.CPUWarning, fallback.CPUCritical, false},
++		{"memory", &value.MemoryWarning, &value.MemoryCritical, fallback.MemoryWarning, fallback.MemoryCritical, false},
++		{"failing pods", &value.FailingPodsWarning, &value.FailingPodsCritical, fallback.FailingPodsWarning, fallback.FailingPodsCritical, true},
++	}
++	for _, p := range pairs {
++		if *p.warning == 0 {
++			*p.warning = p.fbWarning
++		}
++		if *p.critical == 0 {
++			*p.critical = p.fbCritical
++		}
++		if *p.warning < 0 || *p.critical < 0 {
++			return value, fmt.Errorf("service health: %s thresholds must not be negative", p.name)
++		}
++		if *p.critical < *p.warning || (!p.allowWarningEqualsCritical && *p.critical == *p.warning) {
++			return value, fmt.Errorf("service health: %s critical threshold (%g) must be above the warning threshold (%g)", p.name, *p.critical, *p.warning)
++		}
+ 	}
+-	return value
++	return value, nil
+ }
+ 
+ func thresholdSeverity(value, warning, critical float64) Severity {
+diff --git a/internal/servicehealth/service_test.go b/internal/servicehealth/service_test.go
+index d02595f..8fcaf10 100644
+--- a/internal/servicehealth/service_test.go
++++ b/internal/servicehealth/service_test.go
+@@ -2,8 +2,13 @@ package servicehealth
+ 
+ import (
+ 	"context"
++	"errors"
++	"fmt"
++	"regexp"
++	"strconv"
+ 	"strings"
+ 	"sync"
++	"sync/atomic"
+ 	"testing"
+ 	"time"
+ 
+@@ -11,10 +16,34 @@ import (
+ 	"github.com/delangetimm/beholdr/internal/integrations"
+ )
+ 
++// valueFor is the shared scoring fixture: it maps a query template onto the
++// value both the range and the instant evaluation should report.
++func valueFor(query string) float64 {
++	switch {
++	case strings.Contains(query, "offset 1w"):
++		return 1
++	case strings.Contains(query, `code=~"5.."`):
++		return 3
++	case strings.Contains(query, "container_cpu_usage_seconds_total"):
++		return 85
++	case strings.Contains(query, "container_memory_working_set_bytes"):
++		return 96
++	case strings.Contains(query, "waiting_reason"):
++		return 2
++	case strings.Contains(query, "pod_status_phase"):
++		return 1
++	}
++	return 0
++}
++
+ type fakeQuerier struct {
+-	mu      sync.Mutex
+-	queries []string
+-	err     error
++	mu       sync.Mutex
++	queries  []string
++	instants []string
++	err      error
++	// rangeTail, when set, is appended to the range series so the last range
++	// point can be made to disagree with the instant value.
++	rangeTail *float64
+ }
+ 
+ func (f *fakeQuerier) QueryPrometheusRange(_ context.Context, query string, start, _ time.Time, _ time.Duration) ([]integrations.TimeSeries, error) {
+@@ -24,25 +53,38 @@ func (f *fakeQuerier) QueryPrometheusRange(_ context.Context, query string, star
+ 	if f.err != nil {
+ 		return nil, f.err
+ 	}
+-	value := 0.0
+-	switch {
+-	case strings.Contains(query, "offset 1w"):
+-		value = 1
+-	case strings.Contains(query, `code=~"5.."`):
+-		value = 3
+-	case strings.Contains(query, "container_cpu_usage_seconds_total"):
+-		value = 85
+-	case strings.Contains(query, "container_memory_working_set_bytes"):
+-		value = 96
+-	case strings.Contains(query, "waiting_reason"):
+-		value = 2
+-	case strings.Contains(query, "pod_status_phase"):
+-		value = 1
+-	}
+-	return []integrations.TimeSeries{{Values: []integrations.Sample{
++	value := valueFor(query)
++	values := []integrations.Sample{
+ 		{Timestamp: unixSeconds(start), Value: value / 2},
+ 		{Timestamp: unixSeconds(start.Add(time.Minute)), Value: value},
+-	}}}, nil
++	}
++	if f.rangeTail != nil {
++		values = append(values, integrations.Sample{Timestamp: unixSeconds(start.Add(2 * time.Minute)), Value: *f.rangeTail})
++	}
++	return []integrations.TimeSeries{{Values: values}}, nil
++}
++
++func (f *fakeQuerier) QueryPrometheusInstant(_ context.Context, query string, _ time.Time) ([]integrations.InstantSample, error) {
++	f.mu.Lock()
++	f.instants = append(f.instants, query)
++	f.mu.Unlock()
++	if f.err != nil {
++		return nil, f.err
++	}
++	return []integrations.InstantSample{{Sample: integrations.Sample{Value: valueFor(query)}}}, nil
++}
++
++func newService(t *testing.T, querier Querier, cfg Config) *Service {
++	t.Helper()
++	// Caching is off by default in tests so each case controls its own calls.
++	if cfg.CacheTTL == 0 {
++		cfg.CacheTTL = -1
++	}
++	service, err := New(querier, cfg)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return service
+ }
+ 
+ func TestParseWindowIsBounded(t *testing.T) {
+@@ -59,17 +101,62 @@ func TestParseWindowIsBounded(t *testing.T) {
+ 	}
+ }
+ 
++func TestEveryWindowStaysUnderThePointCap(t *testing.T) {
++	for name, window := range windows {
++		if points := window.Duration / window.Step; points > 2_000 {
++			t.Errorf("window %q needs %d points, above the query cap", name, points)
++		}
++	}
++}
++
++// A week-before overlay is only a comparison while the offset series does not
++// overlap the current one. Past seven days it is the same wall-clock data drawn
++// twice.
++func TestComparisonIsSuppressedBeyondOneWeek(t *testing.T) {
++	for _, tc := range []struct {
++		window string
++		want   bool
++	}{{"1h", true}, {"6h", true}, {"24h", true}, {"7d", true}, {"21d", false}} {
++		window, _ := ParseWindow(tc.window)
++		if window.Comparable() != tc.want {
++			t.Errorf("window %s: comparable = %v, want %v", tc.window, window.Comparable(), tc.want)
++		}
++	}
++}
++
++func TestComparisonQueriesAreOnlyIssuedWhenMeaningful(t *testing.T) {
++	for _, tc := range []struct {
++		window     string
++		wantSeries int
++	}{{"7d", 6}, {"21d", 5}} {
++		querier := &fakeQuerier{}
++		service := newService(t, querier, Config{})
++		window, _ := ParseWindow(tc.window)
++		report, err := service.Query(context.Background(), deployment("production", "video-api", 10), nil, window, time.Unix(2_000_000, 0))
++		if err != nil {
++			t.Fatal(err)
++		}
++		querier.mu.Lock()
++		got := len(querier.queries)
++		querier.mu.Unlock()
++		if got != tc.wantSeries {
++			t.Errorf("window %s: %d range queries, want %d", tc.window, got, tc.wantSeries)
++		}
++		if report.Compared != (tc.window == "7d") {
++			t.Errorf("window %s: compared = %v", tc.window, report.Compared)
++		}
++		lines := report.Signals[0].Lines
++		if tc.window == "21d" && len(lines) != 1 {
++			t.Errorf("21d must not promise a week-before line: %+v", lines)
++		}
++	}
++}
++
+ func TestQueryBuildsPerServiceSignalsAndSeverity(t *testing.T) {
+ 	querier := &fakeQuerier{}
+-	service := New(querier, Config{})
++	service := newService(t, querier, Config{})
+ 	window, _ := ParseWindow("7d")
+-	end := time.Unix(2_000_000, 0)
+-	report, err := service.Query(context.Background(), collect.Microservice{
+-		Namespace:      "production",
+-		Name:           "video-api",
+-		Kind:           "Deployment",
+-		DesiredReplica: 10,
+-	}, window, end)
++	report, err := service.Query(context.Background(), deployment("production", "video-api", 10), nil, window, time.Unix(2_000_000, 0))
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -96,87 +183,505 @@ func TestQueryBuildsPerServiceSignalsAndSeverity(t *testing.T) {
+ 	if report.Signals[3].Current == nil || *report.Signals[3].Current != 3 || report.Signals[3].Severity != SeverityCritical {
+ 		t.Fatalf("three failing pods out of ten should be critical: %+v", report.Signals[3])
+ 	}
++}
++
++// The score must come from the instant evaluation. Taking it from the last
++// range point makes severity depend on which chart window is selected: at a
++// one-hour step the newest point can be an hour old, so a spike that started
++// ten minutes ago would be invisible on exactly the view an operator leaves
++// open.
++func TestSeverityComesFromTheInstantQueryNotTheChart(t *testing.T) {
++	quiet := 0.0
++	querier := &fakeQuerier{rangeTail: &quiet}
++	service := newService(t, querier, Config{})
++	for _, name := range []string{"1h", "21d"} {
++		window, _ := ParseWindow(name)
++		report, err := service.Query(context.Background(), deployment("production", "video-api", 10), nil, window, time.Unix(2_000_000, 0))
++		if err != nil {
++			t.Fatal(err)
++		}
++		if report.Signals[1].Current == nil || *report.Signals[1].Current != 85 {
++			t.Fatalf("window %s: CPU should score from the instant value, got %+v", name, report.Signals[1].Current)
++		}
++		if report.Signals[1].Severity != SeverityWarning {
++			t.Fatalf("window %s: 85%% CPU should be warning, got %s", name, report.Signals[1].Severity)
++		}
++		// The chart still ends on the quiet tail; only the score ignores it.
++		points := report.Signals[1].Points
++		if len(points) == 0 || points[len(points)-1]["current"] != 0 {
++			t.Fatalf("window %s: chart should keep every range point: %+v", name, points)
++		}
++	}
++}
++
++func TestGeneratedQueriesAreStable(t *testing.T) {
++	service := newService(t, &fakeQuerier{}, Config{})
++	window, _ := ParseWindow("24h")
++	got := service.queries(deployment("production", "video", 3), window)
+ 
++	want := map[string]string{
++		"errors":          `100 * sum(rate(aspnetcore_requests_duration_seconds_count{kubernetes_namespace="production",app_kubernetes_io_name="video",code=~"5.."}[5m])) / clamp_min(sum(rate(aspnetcore_requests_duration_seconds_count{kubernetes_namespace="production",app_kubernetes_io_name="video"}[5m])), 0.000001)`,
++		"errors_previous": `100 * sum(rate(aspnetcore_requests_duration_seconds_count{kubernetes_namespace="production",app_kubernetes_io_name="video",code=~"5.."}[5m] offset 1w)) / clamp_min(sum(rate(aspnetcore_requests_duration_seconds_count{kubernetes_namespace="production",app_kubernetes_io_name="video"}[5m] offset 1w)), 0.000001)`,
++		"cpu":             `100 * sum(rate(container_cpu_usage_seconds_total{namespace="production",pod=~"^video-[a-z0-9]+-[a-z0-9]{5}$",container!="",container!="POD"}[5m])) / clamp_min(sum(kube_pod_container_resource_limits{namespace="production",pod=~"^video-[a-z0-9]+-[a-z0-9]{5}$",container!="",resource="cpu",unit="core"} > 0), 0.001)`,
++		"memory":          `100 * sum(container_memory_working_set_bytes{namespace="production",pod=~"^video-[a-z0-9]+-[a-z0-9]{5}$",container!="",container!="POD"}) / clamp_min(sum(kube_pod_container_resource_limits{namespace="production",pod=~"^video-[a-z0-9]+-[a-z0-9]{5}$",container!="",resource="memory",unit="byte"} > 0), 1)`,
++		"waiting":         `(sum(max by (namespace,pod) (kube_pod_container_status_waiting_reason{namespace="production",pod=~"^video-[a-z0-9]+-[a-z0-9]{5}$",reason=~"CrashLoopBackOff|ImagePullBackOff|ErrImagePull|CreateContainerConfigError"} == 1)) or 0 * count(kube_pod_info{namespace="production",pod=~"^video-[a-z0-9]+-[a-z0-9]{5}$"}))`,
++		"failed_phase":    `(sum(kube_pod_status_phase{namespace="production",pod=~"^video-[a-z0-9]+-[a-z0-9]{5}$",phase=~"Failed|Unknown"} == 1 unless on (namespace,pod) kube_pod_owner{namespace="production",pod=~"^video-[a-z0-9]+-[a-z0-9]{5}$",owner_kind="Job"}) or 0 * count(kube_pod_info{namespace="production",pod=~"^video-[a-z0-9]+-[a-z0-9]{5}$"}))`,
++	}
++	if len(got) != len(want) {
++		t.Fatalf("want %d queries, got %d: %v", len(want), len(got), keys(got))
++	}
++	for key, expected := range want {
++		if got[key] != expected {
++			t.Errorf("query %q:\n got: %s\nwant: %s", key, got[key], expected)
++		}
++	}
++}
++
++func TestCPUBasisSelectsTheDenominator(t *testing.T) {
++	service := newService(t, &fakeQuerier{}, Config{CPUBasis: CPUBasisRequests})
++	window, _ := ParseWindow("1h")
++	query := service.queries(deployment("ns", "app", 1), window)["cpu"]
++	if !strings.Contains(query, "kube_pod_container_resource_requests") {
++		t.Fatalf("requests basis not applied: %s", query)
++	}
++	if service.cpuUnit() != "% of requests" {
++		t.Fatalf("unit should follow the basis, got %q", service.cpuUnit())
++	}
++}
++
++// The collector only ever labels workloads "Deployment" or "Other", so the
++// default branch has to cover every other shape without becoming a wildcard
++// that absorbs a sibling service's pods.
++func TestPodRegexNeverMatchesASiblingWorkload(t *testing.T) {
++	for _, kind := range []string{"Deployment", "StatefulSet", "DaemonSet", "Other", "Job"} {
++		re := regexp.MustCompile(workloadPodRegex(kind, "api"))
++		// "api-gateway-abcde" is deliberately absent: it is a valid pod name
++		// for both a DaemonSet called "api-gateway" and a Deployment called
++		// "api", so no name-shape regex can separate them. Scoring uses the
++		// exact current pod names instead — see the test below.
++		for _, pod := range []string{
++			"api-gateway-7d9f8c6b54-x2k9p",
++			"api-worker-0",
++			"apiserver-7d9f8c6b54-x2k9p",
++			"api-gateway-7d9f8c6b54-abcde",
++		} {
++			if re.MatchString(pod) {
++				t.Errorf("kind %s: regex %q must not match sibling pod %q", kind, re, pod)
++			}
++		}
++	}
++}
++
++func TestPodRegexMatchesItsOwnPods(t *testing.T) {
++	cases := []struct{ kind, pod string }{
++		{"Deployment", "api-7d9f8c6b54-x2k9p"},
++		{"Deployment", "api-6b9-x2k9p"},
++		{"StatefulSet", "api-0"},
++		{"StatefulSet", "api-12"},
++		{"DaemonSet", "api-x2k9p"},
++		{"Other", "api-7d9f8c6b54-x2k9p"},
++		{"Other", "api-0"},
++		{"Other", "api-x2k9p"},
++	}
++	for _, tc := range cases {
++		if !regexp.MustCompile(workloadPodRegex(tc.kind, "api")).MatchString(tc.pod) {
++			t.Errorf("kind %s should match its own pod %q", tc.kind, tc.pod)
++		}
++	}
++}
++
++// Severity must not be computed from pods the workload does not own. When the
++// collector knows the live pod names they are matched exactly, which closes the
++// one ambiguity name-shape matching cannot.
++func TestScoringUsesExactPodNamesWhenKnown(t *testing.T) {
++	querier := &fakeQuerier{}
++	service := newService(t, querier, Config{})
++	window, _ := ParseWindow("1h")
++	pods := []string{"api-7d9f8c6b54-x2k9p", "api-7d9f8c6b54-b1n4q"}
++	if _, err := service.Query(context.Background(), deployment("ns", "api", 2), pods, window, time.Now()); err != nil {
++		t.Fatal(err)
++	}
+ 	querier.mu.Lock()
+ 	defer querier.mu.Unlock()
+-	if len(querier.queries) != 6 {
+-		t.Fatalf("want six bounded Prometheus queries, got %d", len(querier.queries))
++	for _, query := range querier.instants {
++		if strings.Contains(query, "kube_pod_info") && !strings.Contains(query, `pod=~"^(api-7d9f8c6b54-b1n4q|api-7d9f8c6b54-x2k9p)$"`) {
++			t.Errorf("scoring query should pin the live pods: %s", query)
++		}
+ 	}
+ 	for _, query := range querier.queries {
+-		if strings.Contains(query, "aspnetcore_requests_") {
+-			if !strings.Contains(query, `kubernetes_namespace="production"`) || !strings.Contains(query, `app_kubernetes_io_name="video-api"`) {
+-				t.Errorf("application query is not scoped to the service: %s", query)
+-			}
+-		} else if !strings.Contains(query, `namespace="production"`) || !strings.Contains(query, `pod=~"^video-api-[a-z0-9]{8,10}-[a-z0-9]{5}$"`) {
+-			t.Errorf("Kubernetes query is not scoped to the service: %s", query)
++		if strings.Contains(query, "kube_pod_info") && !strings.Contains(query, `pod=~"^api-[a-z0-9]+-[a-z0-9]{5}$"`) {
++			t.Errorf("chart query should keep the name-shape regex for history: %s", query)
++		}
++	}
++}
++
++func TestScoringFallsBackToTheShapeWhenNoPodsAreKnown(t *testing.T) {
++	querier := &fakeQuerier{}
++	service := newService(t, querier, Config{})
++	window, _ := ParseWindow("1h")
++	if _, err := service.Query(context.Background(), deployment("ns", "api", 0), nil, window, time.Now()); err != nil {
++		t.Fatal(err)
++	}
++	querier.mu.Lock()
++	defer querier.mu.Unlock()
++	for _, query := range querier.instants {
++		if strings.Contains(query, "kube_pod_info") && !strings.Contains(query, `pod=~"^api-[a-z0-9]+-[a-z0-9]{5}$"`) {
++			t.Errorf("scoring should fall back to the shape regex: %s", query)
++		}
++	}
++}
++
++func TestWorkloadPodRegexEscapesNames(t *testing.T) {
++	got := workloadPodRegex("Deployment", "video.api")
++	if got != `^video\.api-[a-z0-9]+-[a-z0-9]{5}$` {
++		t.Fatalf("unexpected escaped pod regex %q", got)
++	}
++}
++
++// Names reaching the templates come from the collector's snapshot of real
++// Kubernetes objects, but the quoting must hold regardless: this is the last
++// line of defence against a crafted name reshaping a query.
++func TestHostileNamesCannotEscapeTheSelector(t *testing.T) {
++	service := newService(t, &fakeQuerier{}, Config{})
++	window, _ := ParseWindow("1h")
++	hostile := collect.Microservice{
++		Namespace: `prod"} or up{job="admin`,
++		Name:      `x"}[5m])) or vector(1) #`,
++		Kind:      "Deployment",
++	}
++	for key, query := range service.queries(hostile, window) {
++		// Every namespace occurrence must be the quoted literal — that is what
++		// proves the value was escaped rather than concatenated in raw.
++		if strings.Contains(query, hostile.Namespace) {
++			t.Errorf("query %q carries the namespace unescaped: %s", key, query)
++		}
++		if !strings.Contains(query, strconv.Quote(hostile.Namespace)) {
++			t.Errorf("query %q should embed the namespace as a quoted literal: %s", key, query)
++		}
++		// The name reaches a regex operand, so it must be regex-escaped too.
++		if strings.Contains(query, "pod=~") && !strings.Contains(query, strconv.Quote("^"+regexp.QuoteMeta(hostile.Name)+"-[a-z0-9]+-[a-z0-9]{5}$")) {
++			t.Errorf("query %q should regex-escape the workload name: %s", key, query)
++		}
++	}
++}
++
++type erroringQuerier struct{ err error }
++
++func (e erroringQuerier) QueryPrometheusRange(context.Context, string, time.Time, time.Time, time.Duration) ([]integrations.TimeSeries, error) {
++	return nil, e.err
++}
++
++func (e erroringQuerier) QueryPrometheusInstant(context.Context, string, time.Time) ([]integrations.InstantSample, error) {
++	return nil, e.err
++}
++
++func TestQueryFailuresAreUnknownWithAnActionableMessage(t *testing.T) {
++	service := newService(t, erroringQuerier{err: integrations.ErrPrometheusQueryRejected}, Config{})
++	window, _ := ParseWindow("1h")
++	report, err := service.Query(context.Background(), deployment("ns", "app", 1), nil, window, time.Now())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if report.Severity != SeverityUnknown {
++		t.Fatalf("a failed query must not read as healthy, got %s", report.Severity)
++	}
++	for _, signal := range report.Signals {
++		if signal.State != StateError {
++			t.Errorf("signal %s should be errored: %+v", signal.Key, signal)
++		}
++		if !strings.Contains(signal.Error, "metric and label names") {
++			t.Errorf("signal %s should say what to fix, got %q", signal.Key, signal.Error)
+ 		}
+ 	}
+ }
+ 
+-func TestQueryReportsMissingMetricsAsUnknown(t *testing.T) {
+-	service := New(emptyQuerier{}, Config{})
++func TestNotConfiguredPropagates(t *testing.T) {
++	service := newService(t, erroringQuerier{err: integrations.ErrPrometheusNotConfigured}, Config{})
+ 	window, _ := ParseWindow("1h")
+-	report, err := service.Query(context.Background(), collect.Microservice{Namespace: "ns", Name: "app", Kind: "Deployment"}, window, time.Now())
++	if _, err := service.Query(context.Background(), deployment("ns", "app", 1), nil, window, time.Now()); !errors.Is(err, integrations.ErrPrometheusNotConfigured) {
++		t.Fatalf("want ErrPrometheusNotConfigured, got %v", err)
++	}
++}
++
++type emptyQuerier struct{}
++
++func (emptyQuerier) QueryPrometheusRange(context.Context, string, time.Time, time.Time, time.Duration) ([]integrations.TimeSeries, error) {
++	return nil, nil
++}
++
++func (emptyQuerier) QueryPrometheusInstant(context.Context, string, time.Time) ([]integrations.InstantSample, error) {
++	return nil, nil
++}
++
++func TestNoMetricsAtAllIsUnknownNotHealthy(t *testing.T) {
++	service := newService(t, emptyQuerier{}, Config{})
++	window, _ := ParseWindow("1h")
++	report, err := service.Query(context.Background(), deployment("ns", "app", 1), nil, window, time.Now())
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	if report.Severity != SeverityUnknown {
+-		t.Fatalf("missing metrics must not be reported healthy, got %s", report.Severity)
++		t.Fatalf("no telemetry at all must not be reported healthy, got %s", report.Severity)
+ 	}
+ 	for _, signal := range report.Signals {
+-		if signal.Severity != SeverityUnknown || signal.Error == "" {
++		if signal.State != StateNoData || signal.Error == "" {
+ 			t.Errorf("missing signal should be explicit: %+v", signal)
+ 		}
+ 	}
+ }
+ 
+-type partialQuerier struct{}
++type cpuOnlyQuerier struct{}
+ 
+-func (partialQuerier) QueryPrometheusRange(_ context.Context, query string, start, _ time.Time, _ time.Duration) ([]integrations.TimeSeries, error) {
++func (cpuOnlyQuerier) QueryPrometheusRange(_ context.Context, query string, start, _ time.Time, _ time.Duration) ([]integrations.TimeSeries, error) {
+ 	if !strings.Contains(query, "container_cpu_usage_seconds_total") {
+ 		return nil, nil
+ 	}
+ 	return []integrations.TimeSeries{{Values: []integrations.Sample{{Timestamp: unixSeconds(start), Value: 25}}}}, nil
+ }
+ 
+-func TestOneHealthySignalDoesNotHideUnknownSignals(t *testing.T) {
+-	service := New(partialQuerier{}, Config{})
++func (cpuOnlyQuerier) QueryPrometheusInstant(_ context.Context, query string, _ time.Time) ([]integrations.InstantSample, error) {
++	if !strings.Contains(query, "container_cpu_usage_seconds_total") {
++		return nil, nil
++	}
++	return []integrations.InstantSample{{Sample: integrations.Sample{Value: 25}}}, nil
++}
++
++// A metric that does not exist for this workload — no memory limit set, no HTTP
++// traffic — says nothing about the service's health, so it is skipped rather
++// than dragging the aggregate to unknown forever. A metric whose *query failed*
++// is a different thing and still counts (see the test above).
++func TestAbsentMetricsDoNotPinTheAggregateToUnknown(t *testing.T) {
++	service := newService(t, cpuOnlyQuerier{}, Config{})
+ 	window, _ := ParseWindow("1h")
+-	report, err := service.Query(context.Background(), collect.Microservice{Namespace: "ns", Name: "app", Kind: "Deployment"}, window, time.Now())
++	report, err := service.Query(context.Background(), deployment("ns", "app", 1), nil, window, time.Now())
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if report.Signals[1].Severity != SeverityHealthy || report.Severity != SeverityUnknown {
+-		t.Fatalf("partial telemetry must keep aggregate state unknown: %+v", report)
++	if report.Signals[1].State != StateOK || report.Signals[1].Severity != SeverityHealthy {
++		t.Fatalf("CPU should be measured and healthy: %+v", report.Signals[1])
++	}
++	if report.Severity != SeverityHealthy {
++		t.Fatalf("aggregate should follow the measured signal, got %s", report.Severity)
++	}
++	for _, key := range []int{0, 2, 3} {
++		if report.Signals[key].State != StateNoData {
++			t.Errorf("signal %s should report no data: %+v", report.Signals[key].Key, report.Signals[key])
++		}
+ 	}
+ }
+ 
+-type emptyQuerier struct{}
++type multiSeriesQuerier struct{ emptyQuerier }
+ 
+-func (emptyQuerier) QueryPrometheusRange(context.Context, string, time.Time, time.Time, time.Duration) ([]integrations.TimeSeries, error) {
+-	return nil, nil
++func (multiSeriesQuerier) QueryPrometheusInstant(context.Context, string, time.Time) ([]integrations.InstantSample, error) {
++	return []integrations.InstantSample{
++		{Metric: map[string]string{"pod": "a"}, Sample: integrations.Sample{Value: 1}},
++		{Metric: map[string]string{"pod": "b"}, Sample: integrations.Sample{Value: 99}},
++	}, nil
+ }
+ 
+-func TestWorkloadPodRegexEscapesNames(t *testing.T) {
+-	got := workloadPodRegex("Deployment", "video.api")
+-	if got != `^video\.api-[a-z0-9]{8,10}-[a-z0-9]{5}$` {
+-		t.Fatalf("unexpected escaped pod regex %q", got)
++// Every template aggregates to a single series. If one ever stops doing so,
++// silently scoring the first element would report a confident wrong number.
++func TestUnexpectedExtraSeriesIsAnErrorNotTheFirstValue(t *testing.T) {
++	service := newService(t, multiSeriesQuerier{}, Config{})
++	window, _ := ParseWindow("1h")
++	report, err := service.Query(context.Background(), deployment("ns", "app", 1), nil, window, time.Now())
++	if err != nil {
++		t.Fatal(err)
++	}
++	if report.Severity != SeverityUnknown {
++		t.Fatalf("ambiguous results must not be scored, got %s", report.Severity)
++	}
++	for _, signal := range report.Signals {
++		if signal.State != StateError {
++			t.Errorf("signal %s should be errored: %+v", signal.Key, signal)
++		}
+ 	}
+ }
+ 
+-func TestSingleReplicaFailureIsCritical(t *testing.T) {
+-	service := New(&fakeQuerier{}, Config{})
++func TestSingleReplicaFailureIsCriticalWithNoWarningBand(t *testing.T) {
++	service := newService(t, &fakeQuerier{}, Config{})
+ 	window, _ := ParseWindow("1h")
+-	report, err := service.Query(context.Background(), collect.Microservice{
+-		Namespace: "production", Name: "singleton", Kind: "Deployment", DesiredReplica: 1,
+-	}, window, time.Now())
++	report, err := service.Query(context.Background(), deployment("production", "singleton", 1), nil, window, time.Now())
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+-	// The fake returns two waiting-pod samples at the end. A singleton must not
+-	// stay merely warning when its only replica is unavailable.
+ 	signal := report.Signals[3]
+ 	if signal.Critical != 1 || signal.Severity != SeverityCritical {
+ 		t.Fatalf("single-replica failure should be critical: %+v", signal)
+ 	}
++	if signal.Warning != nil {
++		t.Fatalf("a single-replica service has no warning band, got %v", *signal.Warning)
++	}
++}
++
++// --- configuration validation ------------------------------------------------
++
++func TestInvalidConfigurationIsRejectedNotSilentlyReplaced(t *testing.T) {
++	cases := []struct {
++		name string
++		cfg  Config
++	}{
++		{"metric name", Config{HTTPRequestsMetric: "not a metric!"}},
++		{"label name", Config{KubePodLabel: "pod name"}},
++		{"cpu basis", Config{CPUBasis: "guesses"}},
++		{"inverted error thresholds", Config{Thresholds: Thresholds{ErrorRateWarning: 10, ErrorRateCritical: 8}}},
++		{"equal cpu thresholds", Config{Thresholds: Thresholds{CPUWarning: 90, CPUCritical: 90}}},
++		{"negative threshold", Config{Thresholds: Thresholds{MemoryWarning: -1}}},
++	}
++	for _, tc := range cases {
++		if _, err := New(&fakeQuerier{}, tc.cfg); err == nil {
++			t.Errorf("%s: want a configuration error, got none", tc.name)
++		}
++	}
++}
++
++func TestValidConfigurationIsAccepted(t *testing.T) {
++	service, err := New(&fakeQuerier{}, Config{
++		HTTPRequestsMetric: "http_server_request_duration_seconds_count",
++		HTTPStatusLabel:    "http_response_status_code",
++		AppServiceLabel:    "service_name",
++		CPUBasis:           CPUBasisRequests,
++		Thresholds:         Thresholds{CPUWarning: 150, CPUCritical: 300},
++	})
++	if err != nil {
++		t.Fatal(err)
++	}
++	window, _ := ParseWindow("1h")
++	query := service.queries(deployment("ns", "app", 1), window)["errors"]
++	if !strings.Contains(query, "http_server_request_duration_seconds_count") ||
++		!strings.Contains(query, `http_response_status_code=~"5.."`) ||
++		!strings.Contains(query, `service_name="app"`) {
++		t.Fatalf("configuration was not applied: %s", query)
++	}
++}
++
++// --- caching and singleflight ------------------------------------------------
++
++type countingQuerier struct {
++	emptyQuerier
++	rangeCalls atomic.Int64
++	release    chan struct{}
++}
++
++func (c *countingQuerier) QueryPrometheusRange(context.Context, string, time.Time, time.Time, time.Duration) ([]integrations.TimeSeries, error) {
++	c.rangeCalls.Add(1)
++	if c.release != nil {
++		<-c.release
++	}
++	return nil, nil
++}
++
++func TestCompletedReportsAreReusedWithinTheTTL(t *testing.T) {
++	querier := &countingQuerier{}
++	service := newService(t, querier, Config{CacheTTL: time.Minute})
++	window, _ := ParseWindow("1h")
++	for i := 0; i < 5; i++ {
++		if _, err := service.Query(context.Background(), deployment("ns", "app", 1), nil, window, time.Now()); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if got := querier.rangeCalls.Load(); got != 6 {
++		t.Fatalf("want one evaluation (6 range queries) reused four times, got %d range queries", got)
++	}
++}
++
++func TestConcurrentRequestsShareOneEvaluation(t *testing.T) {
++	querier := &countingQuerier{release: make(chan struct{})}
++	service := newService(t, querier, Config{CacheTTL: time.Minute})
++	window, _ := ParseWindow("1h")
++
++	const callers = 8
++	var wg sync.WaitGroup
++	errs := make([]error, callers)
++	for i := 0; i < callers; i++ {
++		wg.Add(1)
++		go func(i int) {
++			defer wg.Done()
++			_, errs[i] = service.Query(context.Background(), deployment("ns", "app", 1), nil, window, time.Now())
++		}(i)
++	}
++	// Let the callers pile up on the same key, then let the evaluation finish.
++	time.Sleep(50 * time.Millisecond)
++	close(querier.release)
++	wg.Wait()
++
++	for i, err := range errs {
++		if err != nil {
++			t.Fatalf("caller %d: %v", i, err)
++		}
++	}
++	if got := querier.rangeCalls.Load(); got != 6 {
++		t.Fatalf("want one shared evaluation (6 range queries), got %d", got)
++	}
++}
++
++func TestDifferentWindowsAreCachedSeparately(t *testing.T) {
++	querier := &countingQuerier{}
++	service := newService(t, querier, Config{CacheTTL: time.Minute})
++	for _, name := range []string{"1h", "6h", "1h"} {
++		window, _ := ParseWindow(name)
++		if _, err := service.Query(context.Background(), deployment("ns", "app", 1), nil, window, time.Now()); err != nil {
++			t.Fatal(err)
++		}
++	}
++	if got := querier.rangeCalls.Load(); got != 12 {
++		t.Fatalf("want two evaluations (12 range queries), got %d", got)
++	}
++}
++
++func TestConcurrentQueriesAreBounded(t *testing.T) {
++	var inFlight, peak atomic.Int64
++	querier := &gaugeQuerier{inFlight: &inFlight, peak: &peak}
++	service := newService(t, querier, Config{MaxConcurrentQueries: 2})
++	window, _ := ParseWindow("1h")
++	if _, err := service.Query(context.Background(), deployment("ns", "app", 1), nil, window, time.Now()); err != nil {
++		t.Fatal(err)
++	}
++	if peak.Load() > 2 {
++		t.Fatalf("concurrency cap of 2 exceeded: peak %d", peak.Load())
++	}
++}
++
++type gaugeQuerier struct {
++	inFlight, peak *atomic.Int64
++}
++
++func (g *gaugeQuerier) enter() {
++	current := g.inFlight.Add(1)
++	for {
++		peak := g.peak.Load()
++		if current <= peak || g.peak.CompareAndSwap(peak, current) {
++			break
++		}
++	}
++	time.Sleep(5 * time.Millisecond)
++}
++
++func (g *gaugeQuerier) QueryPrometheusRange(context.Context, string, time.Time, time.Time, time.Duration) ([]integrations.TimeSeries, error) {
++	g.enter()
++	defer g.inFlight.Add(-1)
++	return nil, nil
++}
++
++func (g *gaugeQuerier) QueryPrometheusInstant(context.Context, string, time.Time) ([]integrations.InstantSample, error) {
++	g.enter()
++	defer g.inFlight.Add(-1)
++	return nil, nil
++}
++
++// --- helpers -----------------------------------------------------------------
++
++func deployment(namespace, name string, replicas int32) collect.Microservice {
++	return collect.Microservice{
++		Key: fmt.Sprintf("%s/%s", namespace, name), Namespace: namespace, Name: name,
++		Kind: "Deployment", DesiredReplica: replicas,
++	}
++}
++
++func keys(m map[string]string) []string {
++	out := make([]string, 0, len(m))
++	for k := range m {
++		out = append(out, k)
++	}
++	return out
+ }
+diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
+index bbba78d..bf444c4 100644
+--- a/web/src/lib/types.ts
++++ b/web/src/lib/types.ts
+@@ -59,6 +59,11 @@ export interface IntegrationStatus {
+ 
+ export type ServiceSeverity = "unknown" | "healthy" | "warning" | "critical";
+ 
++// "no_data" means the metric does not exist for this workload (no memory limit
++// set, no HTTP traffic); "error" means the query itself failed. Only the second
++// makes the service's aggregate state unknown.
++export type ServiceSignalState = "ok" | "no_data" | "error";
++
+ export interface ServiceMetricLine {
+   key: string;
+   label: string;
+@@ -73,9 +78,11 @@ export interface ServiceMetricSignal {
+   current?: number;
+   previous?: number;
+   difference?: number;
+-  warning: number;
++  /** Absent when there is no meaningful warning band (a single-replica service). */
++  warning?: number;
+   critical: number;
+   severity: ServiceSeverity;
++  state: ServiceSignalState;
+   lines: ServiceMetricLine[];
+   points: Point[];
+   error?: string;
+@@ -90,4 +97,7 @@ export interface ServiceMetricsReport {
+   step: number;
+   severity: ServiceSeverity;
+   signals: ServiceMetricSignal[];
++  /** False on windows longer than a week, where a week-before overlay would
++   *  overlap the current series instead of comparing against it. */
++  compared: boolean;
+ }
+diff --git a/web/src/routes/microservices/[ns]/[name]/+page.svelte b/web/src/routes/microservices/[ns]/[name]/+page.svelte
+index b1f47f8..a8fcb08 100644
+--- a/web/src/routes/microservices/[ns]/[name]/+page.svelte
++++ b/web/src/routes/microservices/[ns]/[name]/+page.svelte
+@@ -23,11 +23,27 @@
+     unknown: "border-slate-500/30 bg-slate-500/10 text-slate-400",
+   })[severity];
+ 
++  // The API already says what each signal is measured in; the UI must not keep
++  // a second, divergent opinion keyed off the signal name.
++  const isPercent = (signal: ServiceMetricSignal) => signal.unit.trim().startsWith("%");
++
+   function metricValue(signal: ServiceMetricSignal): string {
+     if (signal.current == null) return "—";
+-    if (signal.key === "failing_pods") return Math.round(signal.current).toString();
++    if (!isPercent(signal)) return Math.round(signal.current).toString();
+     return `${signal.current.toFixed(signal.key === "error_rate" ? 2 : 1)}%`;
+   }
++
++  function thresholdLabel(signal: ServiceMetricSignal): string {
++    if (signal.warning == null) return `critical ${signal.critical}`;
++    return `warning ${signal.warning} · critical ${signal.critical}`;
++  }
++
++  const stateNote = (signal: ServiceMetricSignal) =>
++    signal.state === "no_data"
++      ? "Not measured for this workload."
++      : signal.state === "error"
++        ? signal.error
++        : "";
+ </script>
+ 
+ <a class="text-xs text-indigo-300 hover:underline" href="/microservices">← Microservices</a>
+@@ -78,7 +94,9 @@
+     </div>
+   </div>
+ 
+-  {#if metrics.error}
++  {#if metrics.data && metrics.data.window !== metricsWindow}
++    <p class="mt-4 text-sm text-slate-400">Loading {metricsWindow} service metrics…</p>
++  {:else if metrics.error}
+     <div class="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+       Long-range service metrics are unavailable ({metrics.error}). Configure Prometheus on the Observability page.
+     </div>
+@@ -98,13 +116,24 @@
+               {signal.difference > 0 ? "+" : ""}{signal.difference.toFixed(2)} percentage points vs week before
+             </div>
+           {:else}
+-            <div class="mt-1 text-xs text-slate-500">warning {signal.warning} · critical {signal.critical}</div>
++            <div class="mt-1 text-xs text-slate-500">{thresholdLabel(signal)}</div>
++          {/if}
++          {#if signal.state === "error"}
++            <p class="mt-2 text-xs text-amber-300">{signal.error}</p>
++          {:else if signal.state === "no_data"}
++            <p class="mt-2 text-xs text-slate-500">{stateNote(signal)}</p>
+           {/if}
+-          {#if signal.error}<p class="mt-2 text-xs text-amber-300">{signal.error}</p>{/if}
+         </section>
+       {/each}
+     </div>
+ 
++    {#if !metrics.data.compared}
++      <p class="mt-3 text-xs text-slate-500">
++        The week-before overlay is only shown up to the 7d window; beyond that it would overlap the current series
++        rather than compare against it.
++      </p>
++    {/if}
++
+     <div class="mt-5 grid gap-5 xl:grid-cols-2">
+       {#each metrics.data.signals as signal}
+         <section>
+@@ -112,7 +141,7 @@
+             <h3 class="text-sm font-medium text-slate-300">{signal.label}</h3>
+             <span class="text-[11px] text-slate-500">{signal.unit}</span>
+           </div>
+-          <TimeChart data={signal.points} height={180} unit={signal.key === "failing_pods" ? "" : "%"} lines={signal.lines} />
++          <TimeChart data={signal.points} height={180} unit={isPercent(signal) ? "%" : ""} lines={signal.lines} />
+           <p class="mt-1 text-[11px] leading-5 text-slate-500">{signal.description}</p>
+         </section>
+       {/each}
+-- 
+2.43.0
+
