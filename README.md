@@ -48,14 +48,21 @@ deploy/k8s/             plain-manifest equivalent
 ## API
 
 ```
+GET /live                                 liveness: process can serve HTTP (no cluster dependency)
+GET /ready                                readiness: 200 once a recent collection has succeeded, 503 otherwise
+GET /api/health                           rich status for the UI (always 200): ready, last_success, last_error, metrics_available
 GET /api/cluster                          cluster totals + history
 GET /api/nodes                            all nodes
 GET /api/nodes/{name}                     node detail + pods + history
 GET /api/microservices                    all workloads
 GET /api/microservices/{ns}/{name}        workload detail + pods + history
 GET /api/pods                             all pods
-GET /api/health                           liveness/readiness
 ```
+
+`/api/*` data endpoints return `503` until the first collection succeeds, and
+keep serving the last known-good snapshot after that even if later
+collections fail — `/ready` and `/api/health` are what tell you the data
+might be stale.
 
 ## Configuration (env vars)
 
@@ -67,17 +74,37 @@ GET /api/health                           liveness/readiness
 | `BEHOLDR_NAMESPACES` | *(all)* | Comma-separated namespaces to watch |
 | `BEHOLDR_KUBE_MODE` | `auto` | `auto` \| `in-cluster` \| `kubeconfig` |
 | `KUBECONFIG` | *(default)* | kubeconfig path when not in-cluster |
-| `BEHOLDR_CORS` | `true` | Permissive CORS (handy for local dev) |
+| `BEHOLDR_CORS_ORIGINS` | *(empty — disabled)* | Comma-separated allowlist of origins permitted to call the API cross-origin. Empty disables CORS entirely. `*` allows any origin — local development only. |
+
+## Security model
+
+Beholdr has **no built-in authentication** and does not terminate TLS itself.
+Both are expected to be provided by whatever sits in front of it:
+
+- **TLS** — terminate at the Ingress (or load balancer / service mesh). The
+  Terraform module refuses to create an Ingress without a `tls_secret_name`
+  unless you explicitly set `insecure_http = true`; the plain manifest in
+  `deploy/k8s/beholdr.yaml` ships a cert-manager-annotated example.
+- **Authentication** — put an OIDC-aware auth proxy in front of the Ingress,
+  e.g. [oauth2-proxy](https://oauth2-proxy.github.io/oauth2-proxy/) fronting
+  your IdP, wired up via `nginx.ingress.kubernetes.io/auth-url` /
+  `auth-signin` (or your ingress controller's equivalent). The Terraform
+  module refuses to create an Ingress without `auth_annotations` unless you
+  explicitly set `insecure_no_auth = true`.
+- **CORS** — off by default (see `BEHOLDR_CORS_ORIGINS` above). Only needed
+  if you host the UI separately from the API.
+
+Beholdr exposes cluster topology, pod names, and resource usage — treat it
+like any other cluster-admin-adjacent read path.
 
 ## Local development
 
 ```bash
 # backend — uses your current kube context
-go mod tidy          # once: resolves deps + writes go.sum
 go run ./cmd/beholdr # :8000
 
 # frontend (separate shell) — proxies /api to :8000
-cd web && npm install && npm run dev   # :5173
+cd web && npm ci && npm run dev   # :5173
 ```
 
 Or run the full image against your current context:
@@ -86,6 +113,21 @@ Or run the full image against your current context:
 docker compose up --build              # http://localhost:8000
 ```
 
+`go.sum` and `web/package-lock.json` are committed, so `go build`/`go test`
+and `npm ci` resolve the exact same dependency graph everywhere — locally, in
+CI, and in the Docker build. Run `go mod tidy` after changing `go.mod`, or
+`npm install` after changing `web/package.json`, and commit the result.
+
+## Testing
+
+```bash
+go test ./... -race -cover
+cd web && npm run check   # svelte-check (types)
+```
+
+`.github/workflows/ci.yml` runs both, plus a frontend production build and a
+container build, on every pull request.
+
 ## Build & push
 
 ```bash
@@ -93,8 +135,9 @@ docker build -t registry.example.com/beholdr:0.1.0 .
 docker push registry.example.com/beholdr:0.1.0
 ```
 
-The build compiles the SvelteKit UI, embeds it in the Go binary, and ships a
-distroless image (typically ~15–25 MB).
+The build compiles the SvelteKit UI with `npm ci` and the Go binary against
+the committed `go.sum` (no dependency resolution happens inside the build),
+embeds the UI, and ships a distroless image (typically ~15–25 MB).
 
 ## Deploy with Terraform
 
@@ -107,8 +150,12 @@ terraform apply
 
 Creates the namespace, a read-only ServiceAccount + ClusterRole (pods, nodes,
 deployments, HPAs, metrics), the Deployment, a Service, and a configurable
-Ingress (`ingress_class` / `ingress_host` / `ingress_annotations` — point TLS or
-basic-auth annotations there). Prefer raw manifests? See `deploy/k8s/beholdr.yaml`.
+Ingress (`ingress_class` / `ingress_host` / `ingress_annotations`). The
+Ingress requires `tls_secret_name` and `auth_annotations` — `terraform apply`
+fails with a clear error if either is missing, unless you explicitly opt out
+via `insecure_http` / `insecure_no_auth` for a non-production environment.
+See `terraform.tfvars.example` and [Security model](#security-model) above.
+Prefer raw manifests? See `deploy/k8s/beholdr.yaml`.
 
 ## Notes & limits
 

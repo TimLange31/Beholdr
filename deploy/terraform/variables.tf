@@ -52,7 +52,37 @@ variable "ingress_host" {
 }
 
 variable "ingress_annotations" {
-  description = "Extra annotations for the Ingress (TLS, auth, rewrite, etc.)."
+  description = "Extra annotations for the Ingress (rewrite rules, etc. — see auth_annotations for authentication and tls_secret_name for TLS)."
   type        = map(string)
   default     = {}
+}
+
+variable "tls_secret_name" {
+  description = "TLS secret name for the Ingress (e.g. one cert-manager creates via a cluster-issuer annotation in ingress_annotations, or one you manage yourself). Required unless insecure_http is explicitly set — Beholdr exposes cluster topology, pod names, and resource usage."
+  type        = string
+  default     = ""
+}
+
+variable "insecure_http" {
+  description = "Explicitly allow deploying the Ingress without TLS. Do not use in production."
+  type        = bool
+  default     = false
+}
+
+variable "auth_annotations" {
+  description = "Ingress annotations that enforce authentication in front of Beholdr, e.g. an OIDC-aware auth proxy such as oauth2-proxy: { \"nginx.ingress.kubernetes.io/auth-url\" = \"https://oauth2-proxy.example.com/oauth2/auth\", \"nginx.ingress.kubernetes.io/auth-signin\" = \"https://oauth2-proxy.example.com/oauth2/start?rd=$scheme://$host$request_uri\" }. Required unless insecure_no_auth is explicitly set — Beholdr has no built-in authentication."
+  type        = map(string)
+  default     = {}
+}
+
+variable "insecure_no_auth" {
+  description = "Explicitly allow deploying the Ingress without an authentication annotation. Do not use in production."
+  type        = bool
+  default     = false
+}
+
+variable "cors_origins" {
+  description = "Explicit CORS allowlist for the API (BEHOLDR_CORS_ORIGINS). Empty disables CORS entirely (the default) — only set this if a separately-hosted frontend needs to call the API cross-origin."
+  type        = list(string)
+  default     = []
 }

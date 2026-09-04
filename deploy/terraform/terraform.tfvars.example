@@ -3,11 +3,25 @@ namespace    = "beholdr"
 ingress_host = "beholdr.example.com"
 ingress_class = "nginx"
 
-# Optional: TLS via cert-manager, basic-auth, etc.
+# Required: TLS. This must name a real secret (e.g. one cert-manager creates
+# from the cluster-issuer annotation below); otherwise apply fails unless you
+# explicitly set insecure_http = true.
+tls_secret_name = "beholdr-tls"
 ingress_annotations = {
-  # "cert-manager.io/cluster-issuer" = "letsencrypt-prod"
-  # "nginx.ingress.kubernetes.io/auth-type" = "basic"
+  "cert-manager.io/cluster-issuer" = "letsencrypt-prod"
+}
+
+# Required: authentication. Beholdr has no built-in login, so an OIDC-aware
+# proxy must sit in front of it; otherwise apply fails unless you explicitly
+# set insecure_no_auth = true. Example using oauth2-proxy:
+auth_annotations = {
+  "nginx.ingress.kubernetes.io/auth-url"    = "https://oauth2-proxy.example.com/oauth2/auth"
+  "nginx.ingress.kubernetes.io/auth-signin" = "https://oauth2-proxy.example.com/oauth2/start?rd=$scheme://$host$request_uri"
 }
 
 # Restrict to specific namespaces (empty = whole cluster)
 # watch_namespaces = ["production", "staging"]
+
+# Only set this if a separately-hosted frontend needs to call the API
+# cross-origin. Empty (the default) disables CORS entirely.
+# cors_origins = ["https://dashboard.example.com"]

@@ -4,17 +4,17 @@ package collect
 // depends on.
 
 type Cluster struct {
-	NodesTotal          int            `json:"nodes_total"`
-	NodesReady          int            `json:"nodes_ready"`
-	MicroservicesTotal  int            `json:"microservices_total"`
-	PodsTotal           int            `json:"pods_total"`
-	PodsByPhase         map[string]int `json:"pods_by_phase"`
-	CPUCapacity         int64          `json:"cpu_capacity"`
-	MemCapacity         int64          `json:"mem_capacity"`
-	CPUUsed             int64          `json:"cpu_used"`
-	MemUsed             int64          `json:"mem_used"`
-	CPUPct              float64        `json:"cpu_pct"`
-	MemPct              float64        `json:"mem_pct"`
+	NodesTotal         int            `json:"nodes_total"`
+	NodesReady         int            `json:"nodes_ready"`
+	MicroservicesTotal int            `json:"microservices_total"`
+	PodsTotal          int            `json:"pods_total"`
+	PodsByPhase        map[string]int `json:"pods_by_phase"`
+	CPUCapacity        int64          `json:"cpu_capacity"`
+	MemCapacity        int64          `json:"mem_capacity"`
+	CPUUsed            int64          `json:"cpu_used"`
+	MemUsed            int64          `json:"mem_used"`
+	CPUPct             float64        `json:"cpu_pct"`
+	MemPct             float64        `json:"mem_pct"`
 }
 
 type Node struct {
@@ -49,10 +49,10 @@ type Pod struct {
 }
 
 type HPA struct {
-	Min           int32 `json:"min"`
-	Max           int32 `json:"max"`
-	Current       int32 `json:"current"`
-	Desired       int32 `json:"desired"`
+	Min           int32  `json:"min"`
+	Max           int32  `json:"max"`
+	Current       int32  `json:"current"`
+	Desired       int32  `json:"desired"`
 	TargetCPUPct  *int32 `json:"target_cpu_pct"`
 	CurrentCPUPct *int32 `json:"current_cpu_pct"`
 }
