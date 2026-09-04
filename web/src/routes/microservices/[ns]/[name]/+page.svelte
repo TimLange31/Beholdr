@@ -23,11 +23,27 @@
     unknown: "border-slate-500/30 bg-slate-500/10 text-slate-400",
   })[severity];
 
+  // The API already says what each signal is measured in; the UI must not keep
+  // a second, divergent opinion keyed off the signal name.
+  const isPercent = (signal: ServiceMetricSignal) => signal.unit.trim().startsWith("%");
+
   function metricValue(signal: ServiceMetricSignal): string {
     if (signal.current == null) return "—";
-    if (signal.key === "failing_pods") return Math.round(signal.current).toString();
+    if (!isPercent(signal)) return Math.round(signal.current).toString();
     return `${signal.current.toFixed(signal.key === "error_rate" ? 2 : 1)}%`;
   }
+
+  function thresholdLabel(signal: ServiceMetricSignal): string {
+    if (signal.warning == null) return `critical ${signal.critical}`;
+    return `warning ${signal.warning} · critical ${signal.critical}`;
+  }
+
+  const stateNote = (signal: ServiceMetricSignal) =>
+    signal.state === "no_data"
+      ? "Not measured for this workload."
+      : signal.state === "error"
+        ? signal.error
+        : "";
 </script>
 
 <a class="text-xs text-indigo-300 hover:underline" href="/microservices">← Microservices</a>
@@ -78,7 +94,9 @@
     </div>
   </div>
 
-  {#if metrics.error}
+  {#if metrics.data && metrics.data.window !== metricsWindow}
+    <p class="mt-4 text-sm text-slate-400">Loading {metricsWindow} service metrics…</p>
+  {:else if metrics.error}
     <div class="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
       Long-range service metrics are unavailable ({metrics.error}). Configure Prometheus on the Observability page.
     </div>
@@ -98,12 +116,23 @@
               {signal.difference > 0 ? "+" : ""}{signal.difference.toFixed(2)} percentage points vs week before
             </div>
           {:else}
-            <div class="mt-1 text-xs text-slate-500">warning {signal.warning} · critical {signal.critical}</div>
+            <div class="mt-1 text-xs text-slate-500">{thresholdLabel(signal)}</div>
           {/if}
-          {#if signal.error}<p class="mt-2 text-xs text-amber-300">{signal.error}</p>{/if}
+          {#if signal.state === "error"}
+            <p class="mt-2 text-xs text-amber-300">{signal.error}</p>
+          {:else if signal.state === "no_data"}
+            <p class="mt-2 text-xs text-slate-500">{stateNote(signal)}</p>
+          {/if}
         </section>
       {/each}
     </div>
+
+    {#if !metrics.data.compared}
+      <p class="mt-3 text-xs text-slate-500">
+        The week-before overlay is only shown up to the 7d window; beyond that it would overlap the current series
+        rather than compare against it.
+      </p>
+    {/if}
 
     <div class="mt-5 grid gap-5 xl:grid-cols-2">
       {#each metrics.data.signals as signal}
@@ -112,7 +141,7 @@
             <h3 class="text-sm font-medium text-slate-300">{signal.label}</h3>
             <span class="text-[11px] text-slate-500">{signal.unit}</span>
           </div>
-          <TimeChart data={signal.points} height={180} unit={signal.key === "failing_pods" ? "" : "%"} lines={signal.lines} />
+          <TimeChart data={signal.points} height={180} unit={isPercent(signal) ? "%" : ""} lines={signal.lines} />
           <p class="mt-1 text-[11px] leading-5 text-slate-500">{signal.description}</p>
         </section>
       {/each}

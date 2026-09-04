@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,10 +31,11 @@ func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 type fakeSource struct {
 	err         error
 	deployments []appsv1.Deployment
+	pods        []corev1.Pod
 }
 
 func (f *fakeSource) Nodes(context.Context) ([]corev1.Node, error) { return nil, f.err }
-func (f *fakeSource) Pods(context.Context) ([]corev1.Pod, error)   { return nil, f.err }
+func (f *fakeSource) Pods(context.Context) ([]corev1.Pod, error)   { return f.pods, f.err }
 func (f *fakeSource) Deployments(context.Context) ([]appsv1.Deployment, error) {
 	return f.deployments, f.err
 }
@@ -56,7 +58,7 @@ func newTestServer(t *testing.T, corsOrigins []string, collected bool, srcErr er
 		cancel()
 		col.Run(ctx)
 	}
-	return NewServer(col, nil, corsOrigins, testLogger())
+	return NewServer(col, nil, nil, corsOrigins, testLogger())
 }
 
 // newTestServerWithMonitor wires a real integration Monitor, already checked
@@ -67,7 +69,7 @@ func newTestServerWithMonitor(t *testing.T, cfg integrations.Config) *Server {
 	col := collect.New(&fakeSource{}, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
 	mon := integrations.New(cfg, testLogger())
 	mon.Check(context.Background())
-	return NewServer(col, mon, nil, testLogger())
+	return NewServer(col, mon, nil, nil, testLogger())
 }
 
 func do(s *Server, method, path, origin string) *httptest.ResponseRecorder {
@@ -277,33 +279,72 @@ func TestIntegrationsResponseNeverCarriesEndpointsOrCredentials(t *testing.T) {
 	}
 }
 
-type apiMetricsQuerier struct{}
+type apiMetricsQuerier struct {
+	mu       sync.Mutex
+	instants []string
+	err      error
+}
 
-func (apiMetricsQuerier) QueryPrometheusRange(_ context.Context, _ string, start, _ time.Time, _ time.Duration) ([]integrations.TimeSeries, error) {
+func (q *apiMetricsQuerier) QueryPrometheusRange(_ context.Context, _ string, start, _ time.Time, _ time.Duration) ([]integrations.TimeSeries, error) {
+	if q.err != nil {
+		return nil, q.err
+	}
 	return []integrations.TimeSeries{{Values: []integrations.Sample{{Timestamp: float64(start.Unix()), Value: 0.5}}}}, nil
 }
 
-func newServiceMetricsServer(t *testing.T) *Server {
+func (q *apiMetricsQuerier) QueryPrometheusInstant(_ context.Context, query string, _ time.Time) ([]integrations.InstantSample, error) {
+	q.mu.Lock()
+	q.instants = append(q.instants, query)
+	q.mu.Unlock()
+	if q.err != nil {
+		return nil, q.err
+	}
+	return []integrations.InstantSample{{Sample: integrations.Sample{Value: 0.5}}}, nil
+}
+
+func newServiceMetricsServer(t *testing.T, querier *apiMetricsQuerier) *Server {
 	t.Helper()
 	replicas := int32(2)
-	src := &fakeSource{deployments: []appsv1.Deployment{{
-		ObjectMeta: metav1.ObjectMeta{Name: "video", Namespace: "production"},
-		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
-	}}}
+	src := &fakeSource{
+		deployments: []appsv1.Deployment{{
+			ObjectMeta: metav1.ObjectMeta{Name: "video", Namespace: "production"},
+			Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+		}},
+		pods: []corev1.Pod{
+			pod("production", "video-7d9f8c6b54-x2k9p", "video"),
+			pod("production", "video-7d9f8c6b54-b1n4q", "video"),
+			pod("production", "video-gateway-7d9f8c6b54-zzzzz", "video-gateway"),
+		},
+	}
 	col := collect.New(src, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	col.Run(ctx)
-	s := NewServer(col, nil, nil, testLogger())
-	s.serviceHealth = servicehealth.New(apiMetricsQuerier{}, servicehealth.Config{})
-	return s
+	health, err := servicehealth.New(querier, servicehealth.Config{CacheTTL: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewServer(col, nil, health, nil, testLogger())
+}
+
+func pod(namespace, name, workload string) corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: namespace,
+			Labels: map[string]string{"app": workload},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
 }
 
 func TestMicroserviceMetricsEndpoint(t *testing.T) {
-	s := newServiceMetricsServer(t)
+	s := newServiceMetricsServer(t, &apiMetricsQuerier{})
 	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=21d", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("severity must not be cached by the browser, got %q", got)
 	}
 	var report servicehealth.Report
 	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
@@ -312,12 +353,82 @@ func TestMicroserviceMetricsEndpoint(t *testing.T) {
 	if report.Namespace != "production" || report.Service != "video" || report.Window != "21d" || len(report.Signals) != 4 {
 		t.Fatalf("unexpected report: %+v", report)
 	}
+	if report.Compared {
+		t.Error("the 21d window must not claim a week-before comparison")
+	}
+}
+
+// The scoring queries must be pinned to the pods this workload owns, never to
+// a name-shaped guess that can pick up a sibling service.
+func TestMicroserviceMetricsScoresOnlyItsOwnPods(t *testing.T) {
+	querier := &apiMetricsQuerier{}
+	s := newServiceMetricsServer(t, querier)
+	if w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=1h", ""); w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	querier.mu.Lock()
+	defer querier.mu.Unlock()
+	if len(querier.instants) == 0 {
+		t.Fatal("no instant queries were issued")
+	}
+	for _, query := range querier.instants {
+		if !strings.Contains(query, "kube_pod_info") {
+			continue
+		}
+		if !strings.Contains(query, "video-7d9f8c6b54-x2k9p") || !strings.Contains(query, "video-7d9f8c6b54-b1n4q") {
+			t.Errorf("scoring query is not pinned to the workload's pods: %s", query)
+		}
+		if strings.Contains(query, "video-gateway") {
+			t.Errorf("scoring query picked up a sibling workload's pod: %s", query)
+		}
+	}
 }
 
 func TestMicroserviceMetricsRejectsUnsupportedRange(t *testing.T) {
-	s := newServiceMetricsServer(t)
+	s := newServiceMetricsServer(t, &apiMetricsQuerier{})
 	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=90d", "")
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("want 400, got %d", w.Code)
+	}
+}
+
+func TestMicroserviceMetricsUnknownWorkloadIs404(t *testing.T) {
+	s := newServiceMetricsServer(t, &apiMetricsQuerier{})
+	w := do(s, http.MethodGet, "/api/microservices/production/nope/metrics?range=1h", "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", w.Code)
+	}
+}
+
+func TestMicroserviceMetricsWithoutPrometheusIs503(t *testing.T) {
+	querier := &apiMetricsQuerier{err: integrations.ErrPrometheusNotConfigured}
+	s := newServiceMetricsServer(t, querier)
+	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=1h", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A backend failure is reported through the signal states, not as a dead
+// endpoint: the operator still gets the charts and an actionable message.
+func TestMicroserviceMetricsSurfacesQueryFailuresPerSignal(t *testing.T) {
+	querier := &apiMetricsQuerier{err: integrations.ErrPrometheusQueryRejected}
+	s := newServiceMetricsServer(t, querier)
+	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=1h", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var report servicehealth.Report
+	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Severity != servicehealth.SeverityUnknown {
+		t.Fatalf("failed queries must not read as healthy: %s", report.Severity)
+	}
+	body := w.Body.String()
+	for _, secret := range []string{"kube_pod_info", "aspnetcore_", "namespace="} {
+		if strings.Contains(body, secret) {
+			t.Errorf("response leaked query internals (%q): %s", secret, body)
+		}
 	}
 }

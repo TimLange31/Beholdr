@@ -1,0 +1,14 @@
+# Normalise line endings in the repository. Without this, a checkout on Windows
+# and one on Linux disagree on every line of every text file, which shows up as
+# a whole-repository rewrite in `git status` and makes a real diff unreviewable.
+# After adding this, run once: git add --renormalize . && git commit
+* text=auto eol=lf
+
+# Keep the shell scripts and lockfiles byte-stable too.
+*.sh    text eol=lf
+*.go    text eol=lf
+*.tf    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.svelte text eol=lf

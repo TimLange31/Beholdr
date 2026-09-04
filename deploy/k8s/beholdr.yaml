@@ -79,6 +79,46 @@ spec:
             - { name: BEHOLDR_OTEL_COLLECTOR_HEALTH_URL, value: "" }
             - { name: BEHOLDR_INTEGRATION_CHECK_INTERVAL, value: "30" }
             - { name: BEHOLDR_INTEGRATION_REQUEST_TIMEOUT, value: "5" }
+            # Prometheus range/instant queries are real work, not a liveness
+            # probe, so they get their own (much longer) timeout. Reusing the
+            # 5s health-check timeout above makes the long windows fail.
+            - { name: BEHOLDR_PROMETHEUS_QUERY_TIMEOUT, value: "30" }
+            # Service-health reports are reused for this long and bounded to
+            # this many concurrent queries. The UI polls per open browser tab
+            # and each uncached report is ten or more Prometheus queries, so
+            # these are what keep a busy incident from loading the Prometheus
+            # you are debugging with.
+            - { name: BEHOLDR_SERVICE_METRICS_CACHE_TTL, value: "30" }
+            - { name: BEHOLDR_SERVICE_MAX_CONCURRENT_QUERIES, value: "6" }
+            #
+            # Service-health metric profile. Beholdr owns the PromQL; these
+            # name the metrics and labels it selects on. Leave a value unset to
+            # take Beholdr's default (shown in the comment). A value that is
+            # set but unusable stops the pod at startup rather than being
+            # silently replaced.
+            #
+            # ASP.NET Core (Beholdr's defaults):
+            # - { name: BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC, value: "aspnetcore_requests_duration_seconds_count" }
+            # - { name: BEHOLDR_SERVICE_HTTP_STATUS_LABEL, value: "code" }
+            # OpenTelemetry semantic conventions:
+            # - { name: BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC, value: "http_server_request_duration_seconds_count" }
+            # - { name: BEHOLDR_SERVICE_HTTP_STATUS_LABEL, value: "http_response_status_code" }
+            #
+            # Label names depend on your Prometheus relabeling. The app labels
+            # default to kubernetes_namespace / app_kubernetes_io_name; the
+            # cAdvisor and kube-state-metrics labels to namespace / pod.
+            # - { name: BEHOLDR_SERVICE_APP_NAMESPACE_LABEL, value: "kubernetes_namespace" }
+            # - { name: BEHOLDR_SERVICE_APP_SERVICE_LABEL, value: "app_kubernetes_io_name" }
+            # - { name: BEHOLDR_SERVICE_KUBE_NAMESPACE_LABEL, value: "namespace" }
+            # - { name: BEHOLDR_SERVICE_KUBE_POD_LABEL, value: "pod" }
+            #
+            # CPU is scored against limits by default, where over 100% means
+            # throttling. Switch to requests only with thresholds that suit it:
+            # requests are a scheduling floor, and healthy bursty services sit
+            # well above 100% of request.
+            # - { name: BEHOLDR_SERVICE_CPU_BASIS, value: "requests" }
+            # - { name: BEHOLDR_SERVICE_CPU_WARNING, value: "150" }
+            # - { name: BEHOLDR_SERVICE_CPU_CRITICAL, value: "300" }
             # Add BEHOLDR_PROMETHEUS_BEARER_TOKEN and
             # BEHOLDR_ELASTICSEARCH_API_KEY with secretKeyRef entries when
             # authentication is required. Never put credentials in these URLs.
