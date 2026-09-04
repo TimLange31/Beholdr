@@ -1,7 +1,7 @@
 <script lang="ts">
   import { page } from "$app/stores";
   import { poll } from "$lib/poll.svelte.js";
-  import type { Microservice, PodInfo, Point } from "$lib/types.js";
+  import type { Microservice, PodInfo, Point, ServiceMetricSignal, ServiceMetricsReport, ServiceSeverity } from "$lib/types.js";
   import { fmtCpu, fmtMem } from "$lib/format.js";
   import StatCard from "$lib/components/StatCard.svelte";
   import Pill from "$lib/components/Pill.svelte";
@@ -9,6 +9,25 @@
 
   type Resp = { microservice: Microservice; pods: PodInfo[]; history: Point[] };
   const q = poll<Resp>(() => `/api/microservices/${$page.params.ns}/${$page.params.name}`, 5000);
+  let metricsWindow = $state("24h");
+  const metrics = poll<ServiceMetricsReport>(
+    () => `/api/microservices/${$page.params.ns}/${$page.params.name}/metrics?range=${metricsWindow}`,
+    60000,
+  );
+  const windows = ["1h", "6h", "24h", "7d", "21d"];
+
+  const tone = (severity: ServiceSeverity) => ({
+    healthy: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+    warning: "border-amber-500/30 bg-amber-500/10 text-amber-300",
+    critical: "border-rose-500/30 bg-rose-500/10 text-rose-300",
+    unknown: "border-slate-500/30 bg-slate-500/10 text-slate-400",
+  })[severity];
+
+  function metricValue(signal: ServiceMetricSignal): string {
+    if (signal.current == null) return "—";
+    if (signal.key === "failing_pods") return Math.round(signal.current).toString();
+    return `${signal.current.toFixed(signal.key === "error_rate" ? 2 : 1)}%`;
+  }
 </script>
 
 <a class="text-xs text-indigo-300 hover:underline" href="/microservices">← Microservices</a>
@@ -42,6 +61,63 @@
       </div>
     {/if}
   </div>
+
+  <div class="mt-8 flex flex-wrap items-center justify-between gap-3">
+    <div>
+      <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-400">Service health</h2>
+      <p class="mt-1 text-xs text-slate-500">Prometheus-backed signals and alert thresholds</p>
+    </div>
+    <div class="flex rounded-lg border border-white/10 bg-slate-900/60 p-1">
+      {#each windows as window}
+        <button
+          type="button"
+          onclick={() => metricsWindow = window}
+          class="rounded-md px-2.5 py-1 text-xs transition-colors {metricsWindow === window ? 'bg-indigo-500 text-white' : 'text-slate-400 hover:text-slate-200'}"
+        >{window}</button>
+      {/each}
+    </div>
+  </div>
+
+  {#if metrics.error}
+    <div class="mt-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+      Long-range service metrics are unavailable ({metrics.error}). Configure Prometheus on the Observability page.
+    </div>
+  {:else if !metrics.data}
+    <p class="mt-4 text-sm text-slate-400">Loading long-range service metrics…</p>
+  {:else}
+    <div class="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+      {#each metrics.data.signals as signal}
+        <section class="rounded-2xl border border-white/5 bg-slate-900/60 p-4">
+          <div class="flex items-start justify-between gap-2">
+            <div class="text-xs font-medium uppercase tracking-wide text-slate-400">{signal.label}</div>
+            <span class={`rounded-full border px-2 py-0.5 text-[10px] uppercase ${tone(signal.severity)}`}>{signal.severity}</span>
+          </div>
+          <div class="mt-2 text-2xl font-semibold tabular-nums">{metricValue(signal)}</div>
+          {#if signal.key === "error_rate" && signal.difference != null}
+            <div class="mt-1 text-xs {signal.difference > 0 ? 'text-rose-300' : 'text-emerald-300'}">
+              {signal.difference > 0 ? "+" : ""}{signal.difference.toFixed(2)} percentage points vs week before
+            </div>
+          {:else}
+            <div class="mt-1 text-xs text-slate-500">warning {signal.warning} · critical {signal.critical}</div>
+          {/if}
+          {#if signal.error}<p class="mt-2 text-xs text-amber-300">{signal.error}</p>{/if}
+        </section>
+      {/each}
+    </div>
+
+    <div class="mt-5 grid gap-5 xl:grid-cols-2">
+      {#each metrics.data.signals as signal}
+        <section>
+          <div class="mb-2 flex items-baseline justify-between gap-3">
+            <h3 class="text-sm font-medium text-slate-300">{signal.label}</h3>
+            <span class="text-[11px] text-slate-500">{signal.unit}</span>
+          </div>
+          <TimeChart data={signal.points} height={180} unit={signal.key === "failing_pods" ? "" : "%"} lines={signal.lines} />
+          <p class="mt-1 text-[11px] leading-5 text-slate-500">{signal.description}</p>
+        </section>
+      {/each}
+    </div>
+  {/if}
 
   <h2 class="mb-3 mt-8 text-xs font-semibold uppercase tracking-wider text-slate-400">Scaling history</h2>
   <TimeChart

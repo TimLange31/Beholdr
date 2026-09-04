@@ -56,3 +56,38 @@ export interface IntegrationStatus {
   updated_at: number;
   providers: IntegrationProvider[];
 }
+
+export type ServiceSeverity = "unknown" | "healthy" | "warning" | "critical";
+
+export interface ServiceMetricLine {
+  key: string;
+  label: string;
+  color: string;
+}
+
+export interface ServiceMetricSignal {
+  key: string;
+  label: string;
+  unit: string;
+  description: string;
+  current?: number;
+  previous?: number;
+  difference?: number;
+  warning: number;
+  critical: number;
+  severity: ServiceSeverity;
+  lines: ServiceMetricLine[];
+  points: Point[];
+  error?: string;
+}
+
+export interface ServiceMetricsReport {
+  namespace: string;
+  service: string;
+  window: string;
+  start: number;
+  end: number;
+  step: number;
+  severity: ServiceSeverity;
+  signals: ServiceMetricSignal[];
+}

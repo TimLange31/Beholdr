@@ -3,21 +3,25 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/delangetimm/beholdr/internal/collect"
 	"github.com/delangetimm/beholdr/internal/integrations"
+	"github.com/delangetimm/beholdr/internal/servicehealth"
 	"github.com/delangetimm/beholdr/internal/webui"
 )
 
 type Server struct {
-	col          *collect.Collector
-	integrations *integrations.Monitor
-	log          *slog.Logger
-	corsOrigins  []string
+	col           *collect.Collector
+	integrations  *integrations.Monitor
+	serviceHealth *servicehealth.Service
+	log           *slog.Logger
+	corsOrigins   []string
 }
 
 // NewServer builds the API server. corsOrigins is an explicit allowlist of
@@ -25,7 +29,11 @@ type Server struct {
 // entirely (the default). "*" may be included to allow any origin, which is
 // only appropriate for local development.
 func NewServer(col *collect.Collector, integrations *integrations.Monitor, corsOrigins []string, log *slog.Logger) *Server {
-	return &Server{col: col, integrations: integrations, log: log, corsOrigins: corsOrigins}
+	var health *servicehealth.Service
+	if integrations != nil {
+		health = servicehealth.New(integrations, servicehealth.Config{})
+	}
+	return &Server{col: col, integrations: integrations, serviceHealth: health, log: log, corsOrigins: corsOrigins}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -47,6 +55,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/nodes", s.nodes)
 	mux.HandleFunc("GET /api/nodes/{name}", s.nodeDetail)
 	mux.HandleFunc("GET /api/microservices", s.microservices)
+	mux.HandleFunc("GET /api/microservices/{ns}/{name}/metrics", s.microserviceMetrics)
 	mux.HandleFunc("GET /api/microservices/{ns}/{name}", s.microserviceDetail)
 	mux.HandleFunc("GET /api/pods", s.pods)
 	mux.Handle("/", s.spa())
@@ -197,6 +206,45 @@ func (s *Server) microserviceDetail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"microservice": ms, "pods": pods, "history": s.col.History.Get("ms::" + key),
 	})
+}
+
+func (s *Server) microserviceMetrics(w http.ResponseWriter, r *http.Request) {
+	snap, ok := s.requireData(w)
+	if !ok {
+		return
+	}
+	ns, name := r.PathValue("ns"), r.PathValue("name")
+	var workload *collect.Microservice
+	for i := range snap.Microservices {
+		if snap.Microservices[i].Namespace == ns && snap.Microservices[i].Name == name {
+			workload = &snap.Microservices[i]
+			break
+		}
+	}
+	if workload == nil {
+		http.Error(w, "microservice not found", http.StatusNotFound)
+		return
+	}
+	window, ok := servicehealth.ParseWindow(r.URL.Query().Get("range"))
+	if !ok {
+		http.Error(w, "range must be one of: 1h, 6h, 24h, 7d, 21d", http.StatusBadRequest)
+		return
+	}
+	if s.serviceHealth == nil {
+		http.Error(w, "Prometheus is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	report, err := s.serviceHealth.Query(r.Context(), *workload, window, time.Now())
+	if errors.Is(err, integrations.ErrPrometheusNotConfigured) {
+		http.Error(w, "Prometheus is not configured", http.StatusServiceUnavailable)
+		return
+	}
+	if err != nil {
+		s.log.Warn("service health query failed", "namespace", ns, "service", name, "err", err)
+		http.Error(w, "service metrics unavailable", http.StatusBadGateway)
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 func (s *Server) pods(w http.ResponseWriter, r *http.Request) {

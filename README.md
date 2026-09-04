@@ -33,6 +33,9 @@ renders it.
   Elasticsearch logs/traces source, and OpenTelemetry ingestion gateway,
   including whether each one calls itself healthy and whether its certificate
   is actually being verified.
+- **Service health** — bounded Prometheus-backed charts from one hour through
+  21 days for HTTP 5xx rate (with the week-before series), CPU/request usage,
+  memory/limit usage, and failing pods.
 
 > Prerequisite: **metrics-server** must be installed for live CPU/memory. Without
 > it, topology and replica data still work but usage reads 0 (the UI shows a banner).
@@ -63,6 +66,8 @@ GET /api/nodes                            all nodes
 GET /api/nodes/{name}                     node detail + pods + history
 GET /api/microservices                    all workloads
 GET /api/microservices/{ns}/{name}        workload detail + pods + history
+GET /api/microservices/{ns}/{name}/metrics?range=24h
+                                         fixed service signals; range: 1h|6h|24h|7d|21d
 GET /api/pods                             all pods
 ```
 
@@ -128,6 +133,34 @@ vocabulary (`connection refused`, `DNS lookup failed`, `TLS certificate signed
 by an unknown authority — set the CA bundle`, …) that interpolates nothing from
 the endpoint, the credential, or the upstream response. The full error goes to
 the pod log.
+
+## Service health queries
+
+Beholdr owns the PromQL templates and only exposes the five bounded windows
+`1h`, `6h`, `24h`, `7d`, and `21d`. The browser cannot submit arbitrary PromQL.
+Each request is limited to 2,000 evaluation points and a 16 MiB response.
+
+| Signal | Calculation | Warning | Critical |
+|--------|-------------|---------|----------|
+| HTTP error rate | HTTP 5xx request rate / all HTTP request rate | 1% | 5% |
+| Error-rate increase | Current rate minus the aligned `offset 1w` series | +0.5 percentage points | +2 percentage points |
+| CPU | Container CPU usage / Kubernetes CPU requests | 80% | 95% |
+| Memory | Container working set / Kubernetes memory limits | 80% | 95% |
+| Failing pods | Crash/image/config waiting pods plus Failed/Unknown pods | ≥10% (minimum 1) | ≥25% (minimum 2; 1 for a single-replica service) |
+
+These thresholds currently produce health states in the API and UI; they do
+not send notifications yet. Missing metrics produce `unknown`, never a green
+status. The initial NLZIET metric profile uses
+`aspnetcore_requests_duration_seconds_count` with `code=~"5.."`, divided by
+the same request counter without the status filter and scoped by
+`kubernetes_namespace` and `app_kubernetes_io_name`. Kubernetes signals use
+cAdvisor/kube-state-metrics with their separate `namespace` and `pod` labels.
+Deployment infrastructure series are selected by their stable pod-name pattern
+so historical pods remain visible across rollouts.
+
+A complete week-before overlay across the full 21-day window requires 28 days
+of Prometheus retention. With exactly 21 days retained, the current series is
+complete but the comparison series is absent for the earliest seven days.
 
 ### TLS termination
 
@@ -235,8 +268,9 @@ Prefer raw manifests? See `deploy/k8s/beholdr.yaml`.
 
 ## Notes & limits
 
-History is in-memory, so it resets on pod restart and isn't shared across
-replicas — run a single replica (the default). If you later want durable,
-long-range history or alerting, configure external telemetry systems. The
-current integration slice checks backend connectivity only; querying and
-correlating their telemetry will be added behind the same provider boundary.
+Kubernetes collector history is still in-memory, so it resets on pod restart
+and isn't shared across replicas — run a single replica (the default).
+Prometheus-backed service-health charts are read directly from the external
+store and therefore support the configured backend's durable history. Log and
+trace querying and cross-signal correlation are still to be added behind the
+same provider boundary.

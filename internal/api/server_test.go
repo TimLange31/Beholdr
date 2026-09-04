@@ -15,22 +15,27 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/delangetimm/beholdr/internal/collect"
 	"github.com/delangetimm/beholdr/internal/integrations"
 	"github.com/delangetimm/beholdr/internal/k8s"
+	"github.com/delangetimm/beholdr/internal/servicehealth"
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 // fakeSource is an empty-but-successful (or erroring) Source: enough to
 // drive the collector through a poll without a real cluster.
-type fakeSource struct{ err error }
+type fakeSource struct {
+	err         error
+	deployments []appsv1.Deployment
+}
 
 func (f *fakeSource) Nodes(context.Context) ([]corev1.Node, error) { return nil, f.err }
 func (f *fakeSource) Pods(context.Context) ([]corev1.Pod, error)   { return nil, f.err }
 func (f *fakeSource) Deployments(context.Context) ([]appsv1.Deployment, error) {
-	return nil, f.err
+	return f.deployments, f.err
 }
 func (f *fakeSource) HPAs(context.Context) ([]autoscalingv1.HorizontalPodAutoscaler, error) {
 	return nil, nil
@@ -269,5 +274,50 @@ func TestIntegrationsResponseNeverCarriesEndpointsOrCredentials(t *testing.T) {
 	}
 	if !strings.Contains(body, "cluster status green") {
 		t.Fatalf("expected the sanitized health detail to survive: %s", body)
+	}
+}
+
+type apiMetricsQuerier struct{}
+
+func (apiMetricsQuerier) QueryPrometheusRange(_ context.Context, _ string, start, _ time.Time, _ time.Duration) ([]integrations.TimeSeries, error) {
+	return []integrations.TimeSeries{{Values: []integrations.Sample{{Timestamp: float64(start.Unix()), Value: 0.5}}}}, nil
+}
+
+func newServiceMetricsServer(t *testing.T) *Server {
+	t.Helper()
+	replicas := int32(2)
+	src := &fakeSource{deployments: []appsv1.Deployment{{
+		ObjectMeta: metav1.ObjectMeta{Name: "video", Namespace: "production"},
+		Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+	}}}
+	col := collect.New(src, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	col.Run(ctx)
+	s := NewServer(col, nil, nil, testLogger())
+	s.serviceHealth = servicehealth.New(apiMetricsQuerier{}, servicehealth.Config{})
+	return s
+}
+
+func TestMicroserviceMetricsEndpoint(t *testing.T) {
+	s := newServiceMetricsServer(t)
+	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=21d", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var report servicehealth.Report
+	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Namespace != "production" || report.Service != "video" || report.Window != "21d" || len(report.Signals) != 4 {
+		t.Fatalf("unexpected report: %+v", report)
+	}
+}
+
+func TestMicroserviceMetricsRejectsUnsupportedRange(t *testing.T) {
+	s := newServiceMetricsServer(t)
+	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=90d", "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d", w.Code)
 	}
 }

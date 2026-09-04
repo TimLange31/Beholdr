@@ -99,9 +99,10 @@ type provider struct {
 }
 
 type Monitor struct {
-	providers []provider
-	interval  time.Duration
-	log       *slog.Logger
+	providers       []provider
+	prometheusQuery provider
+	interval        time.Duration
+	log             *slog.Logger
 
 	mu   sync.RWMutex
 	snap Snapshot
@@ -161,11 +162,15 @@ func New(cfg Config, log *slog.Logger) *Monitor {
 		})
 	}
 
+	prometheusQuery := providers[0]
+	prometheusQuery.endpoint = endpoint(cfg.PrometheusURL, "/api/v1/query_range")
+
 	return &Monitor{
-		providers: providers,
-		interval:  cfg.Interval,
-		log:       log,
-		snap:      initial,
+		providers:       providers,
+		prometheusQuery: prometheusQuery,
+		interval:        cfg.Interval,
+		log:             log,
+		snap:            initial,
 	}
 }
 
