@@ -33,6 +33,46 @@ production-ready release; **P2** is planned follow-up.
   instant query so it does not vary with the selected chart window, and reports
   cached, de-duplicated and concurrency-bounded so the UI cannot amplify load
   onto Prometheus.
+- [x] Dependency and toolchain vulnerability triage against the actual
+  release build (see below), with the Go build toolchain and frontend build
+  toolchain deliberately upgraded rather than accepting `npm audit fix
+  --force`'s downgrade suggestions.
+
+## Dependency and toolchain vulnerability triage (2026-09-05)
+
+- **Go toolchain.** `govulncheck` found 28 reachable advisories, all in the
+  Go standard library shipped inside the compiled binary (`crypto/tls`,
+  `crypto/x509`, `net/http`, `encoding/asn1`, etc.) plus two in
+  `golang.org/x/net` (GO-2026-4918, GO-2026-5026). The release binary is a
+  static Go build, so the compiler's own standard library is part of its
+  vulnerability surface — this was not caught by dependency scanning alone.
+  Fixed by pinning the release Docker build image to a current patch release
+  (`golang:1.25.14-alpine`, replacing a floating, unsupported
+  `golang:1.22-alpine`) and bumping `golang.org/x/net`/`x/oauth2`/`x/sys`/
+  `x/term`/`x/text`/`x/time` to current versions. Re-running `govulncheck`
+  against the updated graph reports zero reachable module vulnerabilities.
+- **npm/frontend.** `npm audit` reported 7 findings (1 high, 3 moderate, 3
+  low), all rooted in the Vite 5.x dev-server toolchain (path traversal and
+  request-handling issues in Vite/esbuild's dev server) — not reachable in
+  the shipped app, since production serves a prebuilt static SPA from the Go
+  binary and never runs the Vite dev server, but still worth fixing since
+  `npm run dev` is used locally. Fixed deliberately: Vite 5→6,
+  `@sveltejs/vite-plugin-svelte` 4→5, and `@sveltejs/kit`/
+  `@sveltejs/adapter-static`/`svelte-check`/`typescript` bumped to their
+  latest compatible releases, verified with a clean `npm run check` and
+  `npm run build`.
+- **Remaining, accepted.** One low-severity finding (`cookie` < 0.7.0,
+  GHSA-pxg6-pf52-xh8x) is pinned by `@sveltejs/kit`@2.70.3, the latest
+  stable release — the fix ships only in SvelteKit's 3.0.0 prerelease line.
+  Beholdr uses `adapter-static` (a prerendered SPA with no SvelteKit server
+  runtime or cookie handling in production), so this finding is not
+  reachable in the shipped app. Revisit once SvelteKit 3 stabilizes.
+- **Proposed severity policy** (needs explicit sign-off before it gates
+  releases): block a release on any *reachable* high/critical finding in
+  the built binary/image or the production frontend bundle; track
+  dev-toolchain-only and non-reachable findings here instead of blocking on
+  them. Continuous enforcement (running `govulncheck`/`npm audit` in CI) is
+  still open — see "Finish automated quality gates" below.
 
 ## P0 — remaining release blockers
 

@@ -4,7 +4,7 @@ Deployment, configuration, API, and development reference. For the project goal 
 
 ## Stack
 
-- **Backend** — Go 1.22, standard-library `net/http` (method+pattern routing),
+- **Backend** — Go 1.25, standard-library `net/http` (method+pattern routing),
   `client-go` + the official `metrics.k8s.io` clientset, structured logging with
   `log/slog`. A background collector polls the cluster on an interval and keeps a
   rolling in-memory history behind an `RWMutex`.
