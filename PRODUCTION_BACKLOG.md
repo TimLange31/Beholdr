@@ -3,20 +3,42 @@
 ## Product decision
 
 Beholdr is currently a lightweight Kubernetes resource observer with external
-telemetry-provider integration. It is **not** yet a replacement for New Relic,
-Grafana, or Prometheus: Kubernetes state still has about one hour of in-memory
+telemetry-provider integration. It is **not** a replacement for New Relic,
+Grafana, or Prometheus, and per the roadmap decided in #24 it does not intend
+to become one: modules *consume* existing Prometheus, Elasticsearch, and
+OpenTelemetry data rather than Beholdr owning ingestion, storage, or query
+evaluation itself. Kubernetes state still has about one hour of in-memory
 history, while Prometheus supplies bounded per-service long-range charts.
 Beholdr has no notification delivery, log/trace search, durable storage of its
-own, built-in authentication, or arbitrary metric query capability.
+own, built-in authentication, or arbitrary metric query capability — and per
+#24's stated non-goals, unrestricted user-supplied query access and owning the
+telemetry database are deliberately out of scope before v1.
 
-The recommended release path is therefore two tracks:
+This document tracks execution against track 1 below. The architecture,
+runtime-module contract, and version roadmap for track 2 are decided in #24;
+items here that touch that direction are scoped to match it rather than
+re-litigating it.
 
 1. Make the existing observer safe and dependable for production use.
-2. Design and build an observability platform deliberately, instead of trying
-   to extend the polling loop into a Prometheus/New Relic substitute.
+2. Extend it into a modular observability platform along the roadmap and
+   non-goals #24 already decided, not by having Beholdr replace the
+   telemetry systems it integrates with.
 
 Priorities: **P0** blocks a production release; **P1** belongs in the first
 production-ready release; **P2** is planned follow-up.
+
+## Release status
+
+The published `v0.2.0` tag is a **prerelease/preview**, not a completed
+milestone: it shipped before all of the [v0.2.0 milestone](https://github.com/TimLange31/Beholdr/milestone/1)'s
+required items (#4-#7) and release checks were finished, which the release
+notes now say explicitly (see #34). The tag is not being moved. Per #24, a
+tag and GitHub Release are only created once all required milestone items
+and release-qualification checks pass — that policy applies from here on;
+a labeled preview may still ship early. A 2026-09-05 audit of this preview
+found further defects, tracked as patch-level fixes in the
+[v0.2.1 milestone](https://github.com/TimLange31/Beholdr/milestone/7) (#25-#33),
+independent of finishing the v0.2.0 feature scope.
 
 ## Delivered foundations
 
@@ -116,30 +138,42 @@ production-ready release; **P2** is planned follow-up.
   guarantees, and troubleshooting. Remove or add the missing Terraform README
   referenced by the root README.
 
-## P1 — platform architecture decision (required before claiming replacement)
+## P1 — platform capabilities beyond the .NET module roadmap (scoped by #24)
 
-- [ ] **Write an observability architecture RFC.** Decide whether Beholdr will
-  integrate with Prometheus-compatible/OpenTelemetry systems or own ingestion,
-  storage, query, and alert evaluation. Define tenancy, data model, retention,
-  cardinality limits, cost model, availability SLOs, and a migration path.
+The architecture decision this section used to ask for — integrate with
+existing telemetry systems versus have Beholdr own ingestion/storage/query —
+is made: #24 commits to the integration path, with owning the telemetry
+database and unrestricted user-supplied query access as explicit non-goals
+before v1. The items below are scoped to that decision; they are not a
+proposal to revisit it.
 
-- [ ] **Adopt OpenTelemetry as the integration contract.** Support OTLP for
-  traces, metrics, and logs; propagate service/resource attributes; provide
-  Kubernetes enrichment; and publish language/platform onboarding examples.
+- [ ] **Resolve what #24's roadmap leaves open within the integration
+  decision.** Tenancy, data model for cross-provider correlation, retention
+  policy for Beholdr's own operational state (see "Persist history" above),
+  cost model, availability SLOs, and the migration path as more runtime
+  modules and providers are added.
 
-- [ ] **Build a metrics platform.** Ingest application, Kubernetes, host,
-  network, and custom metrics; support labels, dimensional aggregation,
-  recording rules, remote write/read or an equivalent durable protocol,
-  cardinality controls, and a query language/API. The Kubernetes metrics API
-  alone cannot supply this. Fixed service range queries are now present; still
-  add managed Prometheus identity/token refresh, recording rules,
-  query caching/concurrency limits, and configurable metric-schema profiles for
-  ASP.NET Core runtime metrics and future OpenTelemetry metrics.
+- [ ] **Adopt OpenTelemetry as an integration contract alongside Prometheus.**
+  Support OTLP for traces, metrics, and logs from existing OpenTelemetry
+  pipelines; propagate service/resource attributes; provide Kubernetes
+  enrichment; and publish language/platform onboarding examples. Beholdr
+  consumes this data from the systems that already store it — it does not
+  stand up its own ingestion or storage path.
+
+- [ ] **Extend metric consumption from Prometheus and OpenTelemetry.**
+  Fixed, bounded, cached service-range queries with configurable metric/label
+  profiles are delivered (see "Delivered foundations"); #4 covers finishing
+  the configurable ASP.NET Core schema's remaining validation defects and #7
+  covers managed Prometheus identity/token refresh. Remaining here: broader
+  label/dimension support for future runtime modules and recording-rule
+  guidance for keeping Beholdr's own queries cheap — not metric ingestion,
+  storage, or a general query language, which stay out of scope per #24.
 
 - [ ] **Build a dashboard and exploration layer.** Add composable dashboards,
-  panels, variables, annotations, ad-hoc queries, sharing/export, provisioning
-  as code, permissions, and a metric/log/trace explorer. This is the minimum
-  Grafana-like workflow, not just fixed pages.
+  panels, variables, annotations, sharing/export, provisioning as code,
+  permissions, and a metric/log/trace explorer scoped to the fixed queries
+  Beholdr already knows how to run safely — not ad-hoc or arbitrary backend
+  queries, which #24 lists as a non-goal before v1.
 
 - [ ] **Build alerting and incident response.** Add alert rules, evaluation and
   deduplication, silences, routing/escalation, notification integrations,
