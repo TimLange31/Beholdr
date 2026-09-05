@@ -25,9 +25,12 @@ search and cross-signal correlation are still planned.
   memory usage, and recent trends.
 - **Find resource pressure.** Explore individual nodes, the pods running on
   them, and how their usage changes over time.
-- **Understand your workloads.** Inspect Deployment replicas, autoscaling
-  settings, restarts, resource usage, and how pods are spread across nodes.
-  Other workloads appear as pod-derived groups with more limited replica data.
+- **Understand your workloads.** Inspect Deployment, StatefulSet, and
+  DaemonSet replicas (desired/ready read from each controller's own status),
+  autoscaling settings, restarts, resource usage, and how pods are spread
+  across nodes. Jobs are tracked as their own kind, with recurring CronJob
+  runs collapsed into a single workload. Anything else still appears as a
+  pod-derived group with more limited replica data.
 - **Investigate service health.** Connect Prometheus for error rates, CPU,
   memory, and failing-pod charts over windows from one hour to 21 days,
   depending on available metrics and retention.
@@ -40,7 +43,8 @@ It runs as a single small container with the dashboard included.
 ## Try it locally
 
 You need **Go 1.22 or newer**, **Node.js 20 with npm**, and a working kubeconfig
-with permission to read nodes, pods, Deployments, HPAs, and metrics. Beholdr uses
+with permission to read nodes, pods, Deployments, StatefulSets, DaemonSets, HPAs,
+and metrics. Beholdr uses
 your current Kubernetes context. Install **metrics-server** in the cluster for
 live CPU and memory usage; topology and replica information work without it.
 

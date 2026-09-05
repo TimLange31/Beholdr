@@ -33,6 +33,11 @@ production-ready release; **P2** is planned follow-up.
   instant query so it does not vary with the selected chart window, and reports
   cached, de-duplicated and concurrency-bounded so the UI cannot amplify load
   onto Prometheus.
+- [x] StatefulSet and DaemonSet discovery with real desired/ready status
+  (read from their own spec/status, not inferred from observed pod count),
+  kind-aware workload/HPA identity so same-named workloads of different
+  kinds no longer collide, explicit Job handling, and CronJob runs collapsed
+  into one workload instead of one entry per scheduled run.
 
 ## P0 — remaining release blockers
 
@@ -51,11 +56,6 @@ production-ready release; **P2** is planned follow-up.
 - [ ] **Finish automated quality gates.** Backend/frontend tests and builds plus
   the container build run on pull requests. Add IaC validation, vulnerability
   and license checks, publish coverage, and fail on coverage regressions.
-
-- [ ] **Fix documented-versus-actual workload coverage.** Either implement
-  StatefulSet and DaemonSet discovery with their real desired/ready status, or
-  remove the claim that they are first-class microservices. Handle Jobs and
-  CronJobs explicitly rather than grouping them as “Other”.
 
 - [ ] **Run a security and scale validation against a representative cluster.**
   Validate least-privilege RBAC, namespace isolation, API response size,

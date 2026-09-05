@@ -96,24 +96,53 @@ func (c *Client) Pods(ctx context.Context) ([]corev1.Pod, error) {
 }
 
 func (c *Client) Deployments(ctx context.Context) ([]appsv1.Deployment, error) {
-	ns := ""
-	if len(c.namespaces) == 1 {
-		ns = c.namespaces[0]
-	}
-	if len(c.namespaces) <= 1 {
+	return listNamespaced(c.namespaces, func(ns string) ([]appsv1.Deployment, error) {
 		l, err := c.cs.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return nil, err
 		}
 		return l.Items, nil
-	}
-	var out []appsv1.Deployment
-	for _, n := range c.namespaces {
-		l, err := c.cs.AppsV1().Deployments(n).List(ctx, metav1.ListOptions{})
+	})
+}
+
+func (c *Client) StatefulSets(ctx context.Context) ([]appsv1.StatefulSet, error) {
+	return listNamespaced(c.namespaces, func(ns string) ([]appsv1.StatefulSet, error) {
+		l, err := c.cs.AppsV1().StatefulSets(ns).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, l.Items...)
+		return l.Items, nil
+	})
+}
+
+func (c *Client) DaemonSets(ctx context.Context) ([]appsv1.DaemonSet, error) {
+	return listNamespaced(c.namespaces, func(ns string) ([]appsv1.DaemonSet, error) {
+		l, err := c.cs.AppsV1().DaemonSets(ns).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, err
+		}
+		return l.Items, nil
+	})
+}
+
+// listNamespaced runs list once against "" (all namespaces) when the client
+// isn't restricted to a specific set, otherwise once per configured
+// namespace, concatenating the results.
+func listNamespaced[T any](namespaces []string, list func(ns string) ([]T, error)) ([]T, error) {
+	if len(namespaces) <= 1 {
+		ns := ""
+		if len(namespaces) == 1 {
+			ns = namespaces[0]
+		}
+		return list(ns)
+	}
+	var out []T
+	for _, n := range namespaces {
+		items, err := list(n)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, items...)
 	}
 	return out, nil
 }

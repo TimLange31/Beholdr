@@ -185,10 +185,9 @@ func (s *Server) microserviceDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ns, name := r.PathValue("ns"), r.PathValue("name")
-	key := ns + "/" + name
 	var ms *collect.Microservice
 	for i := range snap.Microservices {
-		if snap.Microservices[i].Key == key {
+		if snap.Microservices[i].Namespace == ns && snap.Microservices[i].Name == name {
 			ms = &snap.Microservices[i]
 			break
 		}
@@ -204,7 +203,7 @@ func (s *Server) microserviceDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"microservice": ms, "pods": pods, "history": s.col.History.Get("ms::" + key),
+		"microservice": ms, "pods": pods, "history": s.col.History.Get("ms::" + ms.Key),
 	})
 }
 

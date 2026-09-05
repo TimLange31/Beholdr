@@ -20,10 +20,15 @@ Deployment, configuration, API, and development reference. For the project goal 
   rolling utilization history and running-pod trend.
 - **Nodes** — per-node CPU/mem vs capacity, pods-per-node, which microservices
   run where, and per-node history.
-- **Microservices** — Deployments, plus pod-derived groups for other workloads
-  with summed CPU/mem, request utilization, and Deployment replica/HPA data.
-  Inspect node spread and restarts, then drill in for scaling history and the pod list.
-  Non-Deployment groups infer replicas from observed pods; they do not have full StatefulSet/DaemonSet status.
+- **Microservices** — Deployments, StatefulSets, and DaemonSets, each with
+  summed CPU/mem, request utilization, and replica/HPA data read from that
+  controller's own spec/status (not inferred from observed pod count, so a
+  workload with pods temporarily missing or zero pods scheduled stays
+  visible with an accurate desired count). Jobs are tracked as their own
+  kind, with CronJob-generated runs collapsed into one workload by name.
+  Anything else without a recognized controller falls back to a pod-derived
+  group with more limited replica data. Inspect node spread and restarts,
+  then drill in for scaling history and the pod list.
 - **Observability** — connection state for the Prometheus metrics source,
   Elasticsearch logs/traces source, and OpenTelemetry ingestion gateway,
   including whether each one calls itself healthy and whether its certificate
