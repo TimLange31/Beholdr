@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +18,15 @@ import (
 	"github.com/delangetimm/beholdr/internal/k8s"
 )
 
+// rsHash strips the hash suffix Kubernetes appends to a ReplicaSet name
+// (itself derived from the Deployment) so pods can be attributed back to
+// their Deployment by name.
 var rsHash = regexp.MustCompile(`-[a-z0-9]{8,10}$`)
+
+// jobSuffix strips the timestamp suffix a CronJob appends to the Jobs it
+// creates, so successive scheduled runs collapse into one workload instead
+// of a new entry per run.
+var jobSuffix = regexp.MustCompile(`-\d{8,10}$`)
 
 // Source is the subset of the k8s client the collector consumes (interface
 // keeps the collector testable).
@@ -25,6 +34,8 @@ type Source interface {
 	Nodes(context.Context) ([]corev1.Node, error)
 	Pods(context.Context) ([]corev1.Pod, error)
 	Deployments(context.Context) ([]appsv1.Deployment, error)
+	StatefulSets(context.Context) ([]appsv1.StatefulSet, error)
+	DaemonSets(context.Context) ([]appsv1.DaemonSet, error)
 	HPAs(context.Context) ([]autoscalingv1.HorizontalPodAutoscaler, error)
 	NodeMetrics(context.Context) map[string]k8s.Usage
 	PodMetrics(context.Context) map[string]k8s.Usage
@@ -142,6 +153,18 @@ func (c *Collector) collect(parent context.Context) {
 		c.recordErr(err)
 		return
 	}
+	statefulSets, err := c.src.StatefulSets(ctx)
+	if err != nil {
+		c.log.Error("list statefulsets", "err", err)
+		c.recordErr(err)
+		return
+	}
+	daemonSets, err := c.src.DaemonSets(ctx)
+	if err != nil {
+		c.log.Error("list daemonsets", "err", err)
+		c.recordErr(err)
+		return
+	}
 	hpas, _ := c.src.HPAs(ctx)
 	nodeUsage := c.src.NodeMetrics(ctx)
 	podUsage := c.src.PodMetrics(ctx)
@@ -150,7 +173,7 @@ func (c *Collector) collect(parent context.Context) {
 
 	nodeMap := buildNodes(nodes, nodeUsage)
 	podList, byNode, byMS := buildPods(pods, podUsage)
-	msMap := buildMicroservices(deployments, hpas, byMS)
+	msMap := buildMicroservices(deployments, statefulSets, daemonSets, hpas, byMS)
 
 	for name, n := range nodeMap {
 		np := byNode[name]
@@ -260,7 +283,7 @@ func buildPods(pods []corev1.Pod, usage map[string]k8s.Usage) ([]Pod, map[string
 	byMS := map[string][]Pod{}
 	for i := range pods {
 		p := &pods[i]
-		workload := workloadOf(p)
+		kind, workload := ownerOf(p)
 		reqCPU, reqMem := podRequests(p)
 		u := usage[p.Namespace+"/"+p.Name]
 		var restarts int32
@@ -283,44 +306,87 @@ func buildPods(pods []corev1.Pod, usage map[string]k8s.Usage) ([]Pod, map[string
 		if e.Node != "" {
 			byNode[e.Node] = append(byNode[e.Node], e)
 		}
-		byMS[p.Namespace+"/"+workload] = append(byMS[p.Namespace+"/"+workload], e)
+		key := msKey(p.Namespace, kind, workload)
+		byMS[key] = append(byMS[key], e)
 	}
 	return list, byNode, byMS
 }
 
-func buildMicroservices(deps []appsv1.Deployment, hpas []autoscalingv1.HorizontalPodAutoscaler, byMS map[string][]Pod) map[string]Microservice {
+// msKey identifies a workload by namespace, controller kind and name, so a
+// Deployment and a StatefulSet that happen to share a name in the same
+// namespace are tracked as distinct microservices instead of colliding.
+func msKey(ns, kind, name string) string { return ns + "/" + kind + "/" + name }
+
+func splitMSKey(k string) (ns, kind, name string) {
+	ns, rest, _ := strings.Cut(k, "/")
+	kind, name, _ = strings.Cut(rest, "/")
+	return
+}
+
+func buildMicroservices(deps []appsv1.Deployment, stss []appsv1.StatefulSet, dss []appsv1.DaemonSet, hpas []autoscalingv1.HorizontalPodAutoscaler, byMS map[string][]Pod) map[string]Microservice {
 	hpaByTarget := map[string]autoscalingv1.HorizontalPodAutoscaler{}
 	for _, h := range hpas {
-		hpaByTarget[h.Namespace+"/"+h.Spec.ScaleTargetRef.Name] = h
+		kind := h.Spec.ScaleTargetRef.Kind
+		if kind == "" {
+			kind = "Deployment"
+		}
+		hpaByTarget[msKey(h.Namespace, kind, h.Spec.ScaleTargetRef.Name)] = h
 	}
+
 	out := map[string]Microservice{}
 	seen := map[string]bool{}
-	for i := range deps {
-		d := &deps[i]
-		key := d.Namespace + "/" + d.Name
+	addController := func(ns, name, kind string, desired, ready int32) {
+		key := msKey(ns, kind, name)
 		seen[key] = true
 		pods := byMS[key]
 		var hpa *autoscalingv1.HorizontalPodAutoscaler
 		if h, ok := hpaByTarget[key]; ok {
 			hpa = &h
 		}
-		desired := int32(len(pods))
+		out[key] = msEntry(ns, name, kind, desired, ready, pods, hpa)
+	}
+
+	for i := range deps {
+		d := &deps[i]
+		desired := int32(len(byMS[msKey(d.Namespace, "Deployment", d.Name)]))
 		if d.Spec.Replicas != nil {
 			desired = *d.Spec.Replicas
 		}
-		out[key] = msEntry(d.Namespace, d.Name, "Deployment", desired, d.Status.ReadyReplicas, pods, hpa)
+		addController(d.Namespace, d.Name, "Deployment", desired, d.Status.ReadyReplicas)
 	}
-	// workloads with pods but no matching Deployment
+	for i := range stss {
+		s := &stss[i]
+		desired := int32(1)
+		if s.Spec.Replicas != nil {
+			desired = *s.Spec.Replicas
+		}
+		addController(s.Namespace, s.Name, "StatefulSet", desired, s.Status.ReadyReplicas)
+	}
+	for i := range dss {
+		ds := &dss[i]
+		addController(ds.Namespace, ds.Name, "DaemonSet", ds.Status.DesiredNumberScheduled, ds.Status.NumberReady)
+	}
+
+	// Workloads with pods but no matching controller object above (bare
+	// Jobs, CronJob-created Jobs, or unmanaged pods) stay visible under
+	// whatever kind their owner reference reported, keyed so they never
+	// collide with a controller of a different kind sharing the same name.
 	for key, pods := range byMS {
 		if seen[key] {
 			continue
 		}
-		ns, name := splitKey(key)
+		ns, kind, name := splitMSKey(key)
 		var hpa *autoscalingv1.HorizontalPodAutoscaler
 		if h, ok := hpaByTarget[key]; ok {
 			hpa = &h
 		}
-		out[key] = msEntry(ns, name, "Other", int32(len(pods)), 0, pods, hpa)
+		running := 0
+		for _, p := range pods {
+			if p.Phase == "Running" {
+				running++
+			}
+		}
+		out[key] = msEntry(ns, name, kind, int32(len(pods)), int32(running), pods, hpa)
 	}
 	return out
 }
@@ -358,7 +424,7 @@ func msEntry(ns, name, kind string, desired, ready int32, pods []Pod, hpa *autos
 		util = &v
 	}
 	m := Microservice{
-		Key: ns + "/" + name, Namespace: ns, Name: name, Kind: kind,
+		Key: msKey(ns, kind, name), Namespace: ns, Name: name, Kind: kind,
 		DesiredReplica: desired, ReadyReplicas: ready, RunningPods: running,
 		Restarts: restarts, Nodes: nodes,
 		CPUUsed: cpuUsed, MemUsed: memUsed, CPURequest: cpuReq, MemRequest: memReq,
@@ -410,22 +476,37 @@ func buildCluster(nodeMap map[string]Node, pods []Pod, ms map[string]Microservic
 
 // --- helpers ----------------------------------------------------------------
 
-func workloadOf(p *corev1.Pod) string {
+// ownerOf identifies the controller kind and name a pod belongs to.
+// ReplicaSet ownership resolves to the owning Deployment's name (the hash
+// suffix Kubernetes appends to the ReplicaSet is stripped); Job ownership
+// resolves to the owning CronJob's name when the Job carries the
+// scheduler's timestamp suffix, so successive scheduled runs collapse into
+// one workload instead of a new entry per run.
+func ownerOf(p *corev1.Pod) (kind, name string) {
 	for _, ref := range p.OwnerReferences {
 		switch ref.Kind {
 		case "ReplicaSet":
-			return rsHash.ReplaceAllString(ref.Name, "")
-		case "StatefulSet", "DaemonSet", "Job":
-			return ref.Name
+			return "Deployment", rsHash.ReplaceAllString(ref.Name, "")
+		case "StatefulSet":
+			return "StatefulSet", ref.Name
+		case "DaemonSet":
+			return "DaemonSet", ref.Name
+		case "Job":
+			return "Job", jobSuffix.ReplaceAllString(ref.Name, "")
 		}
 	}
 	if v, ok := p.Labels["app"]; ok {
-		return v
+		return "Other", v
 	}
 	if v, ok := p.Labels["app.kubernetes.io/name"]; ok {
-		return v
+		return "Other", v
 	}
-	return p.Name
+	return "Other", p.Name
+}
+
+func workloadOf(p *corev1.Pod) string {
+	_, name := ownerOf(p)
+	return name
 }
 
 func podRequests(p *corev1.Pod) (cpu, mem int64) {
@@ -467,15 +548,6 @@ func sortedMS(m map[string]Microservice) []Microservice {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CPUUsed > out[j].CPUUsed })
 	return out
-}
-
-func splitKey(k string) (ns, name string) {
-	for i := 0; i < len(k); i++ {
-		if k[i] == '/' {
-			return k[:i], k[i+1:]
-		}
-	}
-	return k, ""
 }
 
 func pct(used, cap int64) float64 {

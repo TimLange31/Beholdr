@@ -23,12 +23,14 @@ func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard,
 // errors, so collect() failure/recovery paths can be exercised without a
 // real cluster.
 type fakeSource struct {
-	nodes       []corev1.Node
-	pods        []corev1.Pod
-	deployments []appsv1.Deployment
-	hpas        []autoscalingv1.HorizontalPodAutoscaler
-	nodeUsage   map[string]k8s.Usage
-	podUsage    map[string]k8s.Usage
+	nodes        []corev1.Node
+	pods         []corev1.Pod
+	deployments  []appsv1.Deployment
+	statefulSets []appsv1.StatefulSet
+	daemonSets   []appsv1.DaemonSet
+	hpas         []autoscalingv1.HorizontalPodAutoscaler
+	nodeUsage    map[string]k8s.Usage
+	podUsage     map[string]k8s.Usage
 
 	nodesErr error
 	podsErr  error
@@ -39,6 +41,12 @@ func (f *fakeSource) Nodes(context.Context) ([]corev1.Node, error) { return f.no
 func (f *fakeSource) Pods(context.Context) ([]corev1.Pod, error)   { return f.pods, f.podsErr }
 func (f *fakeSource) Deployments(context.Context) ([]appsv1.Deployment, error) {
 	return f.deployments, f.depsErr
+}
+func (f *fakeSource) StatefulSets(context.Context) ([]appsv1.StatefulSet, error) {
+	return f.statefulSets, nil
+}
+func (f *fakeSource) DaemonSets(context.Context) ([]appsv1.DaemonSet, error) {
+	return f.daemonSets, nil
 }
 func (f *fakeSource) HPAs(context.Context) ([]autoscalingv1.HorizontalPodAutoscaler, error) {
 	return f.hpas, nil
@@ -256,5 +264,216 @@ func TestWorkloadOf(t *testing.T) {
 func TestPctZeroCapacityIsZeroNotNaN(t *testing.T) {
 	if got := pct(100, 0); got != 0 {
 		t.Errorf("pct with zero capacity: want 0, got %v", got)
+	}
+}
+
+func podOwnedBy(ns, name, ownerKind, ownerName string) corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       ns,
+			OwnerReferences: []metav1.OwnerReference{{Kind: ownerKind, Name: ownerName}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func findMS(t *testing.T, ms map[string]Microservice, ns, kind, name string) Microservice {
+	t.Helper()
+	m, ok := ms[msKey(ns, kind, name)]
+	if !ok {
+		t.Fatalf("want microservice %s/%s/%s, have keys %v", ns, kind, name, mapKeys(ms))
+	}
+	return m
+}
+
+func mapKeys[K comparable, V any](m map[K]V) []K {
+	out := make([]K, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+// TestStatefulSetAndDaemonSetReportAuthoritativeReplicas guards the core bug
+// in #32: desired/ready for StatefulSets and DaemonSets must come from their
+// own status, not be derived from how many pods happen to be observed (a pod
+// down for a moment must not silently shrink "desired").
+func TestStatefulSetAndDaemonSetReportAuthoritativeReplicas(t *testing.T) {
+	sts := appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
+		Status:     appsv1.StatefulSetStatus{ReadyReplicas: 2},
+	}
+	ds := appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+		Status:     appsv1.DaemonSetStatus{DesiredNumberScheduled: 3, NumberReady: 2},
+	}
+	pods := []corev1.Pod{
+		podOwnedBy("default", "db-0", "StatefulSet", "db"),
+		podOwnedBy("default", "db-1", "StatefulSet", "db"),
+		// db-2 is down/missing entirely: only 2 of 3 pods observed.
+		podOwnedBy("default", "agent-a", "DaemonSet", "agent"),
+		podOwnedBy("default", "agent-b", "DaemonSet", "agent"),
+	}
+	src := &fakeSource{
+		nodes:        []corev1.Node{{ObjectMeta: metav1.ObjectMeta{Name: "node-1"}}},
+		pods:         pods,
+		statefulSets: []appsv1.StatefulSet{sts},
+		daemonSets:   []appsv1.DaemonSet{ds},
+	}
+	c := New(src, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+	c.collect(context.Background())
+
+	msMap := map[string]Microservice{}
+	for _, m := range c.Snapshot().Microservices {
+		msMap[m.Key] = m
+	}
+
+	db := findMS(t, msMap, "default", "StatefulSet", "db")
+	if db.DesiredReplica != 3 {
+		t.Errorf("statefulset desired: want 3 (from spec, not pod count), got %d", db.DesiredReplica)
+	}
+	if db.ReadyReplicas != 2 {
+		t.Errorf("statefulset ready: want 2 (from status), got %d", db.ReadyReplicas)
+	}
+
+	agent := findMS(t, msMap, "default", "DaemonSet", "agent")
+	if agent.DesiredReplica != 3 {
+		t.Errorf("daemonset desired: want 3 (from DesiredNumberScheduled), got %d", agent.DesiredReplica)
+	}
+	if agent.ReadyReplicas != 2 {
+		t.Errorf("daemonset ready: want 2 (from NumberReady), got %d", agent.ReadyReplicas)
+	}
+}
+
+// TestZeroPodWorkloadStaysVisible guards against a StatefulSet/DaemonSet
+// with no currently-observed pods disappearing from the microservice list
+// entirely, per #32's acceptance criteria.
+func TestZeroPodWorkloadStaysVisible(t *testing.T) {
+	sts := appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
+		Status:     appsv1.StatefulSetStatus{ReadyReplicas: 0},
+	}
+	src := &fakeSource{statefulSets: []appsv1.StatefulSet{sts}}
+	c := New(src, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+	c.collect(context.Background())
+
+	snap := c.Snapshot()
+	if len(snap.Microservices) != 1 {
+		t.Fatalf("want the zero-pod statefulset to remain visible, got %+v", snap.Microservices)
+	}
+	if got := snap.Microservices[0]; got.Kind != "StatefulSet" || got.DesiredReplica != 3 || got.ReadyReplicas != 0 {
+		t.Errorf("want StatefulSet desired=3 ready=0, got %+v", got)
+	}
+}
+
+// TestSameNameDifferentKindWorkloadsDoNotCollide guards against a Deployment
+// and a StatefulSet sharing a name in the same namespace merging into one
+// entry and losing data, per #32's acceptance criteria.
+func TestSameNameDifferentKindWorkloadsDoNotCollide(t *testing.T) {
+	dep := appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"},
+		Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(2)},
+		Status:     appsv1.DeploymentStatus{ReadyReplicas: 2},
+	}
+	sts := appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(1)},
+		Status:     appsv1.StatefulSetStatus{ReadyReplicas: 1},
+	}
+	pods := []corev1.Pod{
+		podOwnedBy("default", "shared-rs1-abc12345", "ReplicaSet", "shared-abc12345"),
+		podOwnedBy("default", "shared-rs2-abc12345", "ReplicaSet", "shared-abc12345"),
+		podOwnedBy("default", "shared-0", "StatefulSet", "shared"),
+	}
+	src := &fakeSource{
+		pods:         pods,
+		deployments:  []appsv1.Deployment{dep},
+		statefulSets: []appsv1.StatefulSet{sts},
+	}
+	c := New(src, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+	c.collect(context.Background())
+
+	snap := c.Snapshot()
+	if len(snap.Microservices) != 2 {
+		t.Fatalf("want 2 distinct microservices for same-name different-kind workloads, got %+v", snap.Microservices)
+	}
+	msMap := map[string]Microservice{}
+	for _, m := range snap.Microservices {
+		msMap[m.Key] = m
+	}
+	d := findMS(t, msMap, "default", "Deployment", "shared")
+	if d.DesiredReplica != 2 || d.RunningPods != 2 {
+		t.Errorf("deployment entry corrupted by collision: %+v", d)
+	}
+	s := findMS(t, msMap, "default", "StatefulSet", "shared")
+	if s.DesiredReplica != 1 || s.RunningPods != 1 {
+		t.Errorf("statefulset entry corrupted by collision: %+v", s)
+	}
+}
+
+// TestHPAMatchesTargetKind guards against an HPA targeting a Deployment
+// being attached to a same-named StatefulSet (or vice versa).
+func TestHPAMatchesTargetKind(t *testing.T) {
+	sts := appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"},
+		Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(1)},
+	}
+	dep := appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: "default"},
+		Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(1)},
+	}
+	hpa := autoscalingv1.HorizontalPodAutoscaler{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-hpa", Namespace: "default"},
+		Spec: autoscalingv1.HorizontalPodAutoscalerSpec{
+			ScaleTargetRef: autoscalingv1.CrossVersionObjectReference{Kind: "StatefulSet", Name: "shared"},
+			MaxReplicas:    int32(5),
+		},
+	}
+	src := &fakeSource{
+		deployments:  []appsv1.Deployment{dep},
+		statefulSets: []appsv1.StatefulSet{sts},
+		hpas:         []autoscalingv1.HorizontalPodAutoscaler{hpa},
+	}
+	c := New(src, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+	c.collect(context.Background())
+
+	msMap := map[string]Microservice{}
+	for _, m := range c.Snapshot().Microservices {
+		msMap[m.Key] = m
+	}
+	if findMS(t, msMap, "default", "StatefulSet", "shared").HPA == nil {
+		t.Error("want the HPA attached to the StatefulSet it targets")
+	}
+	if findMS(t, msMap, "default", "Deployment", "shared").HPA != nil {
+		t.Error("HPA targeting the StatefulSet must not attach to the same-named Deployment")
+	}
+}
+
+// TestCronJobRunsCollapseIntoOneWorkload guards the Job/CronJob handling
+// required by #32: successive scheduled Job runs (whose generated names
+// carry a timestamp suffix) should collapse into a single "Job" workload
+// rather than one entry per run.
+func TestCronJobRunsCollapseIntoOneWorkload(t *testing.T) {
+	pods := []corev1.Pod{
+		podOwnedBy("default", "backup-1758000000-abc", "Job", "backup-1758000000"),
+		podOwnedBy("default", "backup-1758003600-def", "Job", "backup-1758003600"),
+	}
+	src := &fakeSource{pods: pods}
+	c := New(src, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+	c.collect(context.Background())
+
+	snap := c.Snapshot()
+	if len(snap.Microservices) != 1 {
+		t.Fatalf("want cronjob runs collapsed into one workload, got %+v", snap.Microservices)
+	}
+	m := snap.Microservices[0]
+	if m.Kind != "Job" || m.Name != "backup" {
+		t.Errorf("want kind=Job name=backup, got kind=%s name=%s", m.Kind, m.Name)
+	}
+	if m.RunningPods != 2 {
+		t.Errorf("want both job runs' pods counted, got %d", m.RunningPods)
 	}
 }

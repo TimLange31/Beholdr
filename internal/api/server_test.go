@@ -39,6 +39,8 @@ func (f *fakeSource) Pods(context.Context) ([]corev1.Pod, error)   { return f.po
 func (f *fakeSource) Deployments(context.Context) ([]appsv1.Deployment, error) {
 	return f.deployments, f.err
 }
+func (f *fakeSource) StatefulSets(context.Context) ([]appsv1.StatefulSet, error) { return nil, nil }
+func (f *fakeSource) DaemonSets(context.Context) ([]appsv1.DaemonSet, error)     { return nil, nil }
 func (f *fakeSource) HPAs(context.Context) ([]autoscalingv1.HorizontalPodAutoscaler, error) {
 	return nil, nil
 }
@@ -334,6 +336,53 @@ func pod(namespace, name, workload string) corev1.Pod {
 			Labels: map[string]string{"app": workload},
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+// TestMicroserviceDetailEndpoint guards the #32 fix to how the detail route
+// resolves a microservice: Key now embeds the controller kind
+// ("ns/kind/name"), so the handler must match on Namespace+Name from the
+// URL and use the matched entry's own Key to look up its history series
+// rather than reconstructing "ns/name".
+func TestMicroserviceDetailEndpoint(t *testing.T) {
+	replicas := int32(2)
+	src := &fakeSource{
+		deployments: []appsv1.Deployment{{
+			ObjectMeta: metav1.ObjectMeta{Name: "video", Namespace: "production"},
+			Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+			Status:     appsv1.DeploymentStatus{ReadyReplicas: 2},
+		}},
+		pods: []corev1.Pod{
+			pod("production", "video-7d9f8c6b54-x2k9p", "video"),
+			pod("production", "video-7d9f8c6b54-b1n4q", "video"),
+		},
+	}
+	col := collect.New(src, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	col.Run(ctx)
+	s := NewServer(col, nil, nil, nil, testLogger())
+
+	w := do(s, http.MethodGet, "/api/microservices/production/video", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp struct {
+		Microservice collect.Microservice `json:"microservice"`
+		Pods         []collect.Pod        `json:"pods"`
+		History      []collect.Point      `json:"history"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Microservice.Kind != "Deployment" || resp.Microservice.DesiredReplica != 2 {
+		t.Errorf("want Deployment desired=2, got %+v", resp.Microservice)
+	}
+	if len(resp.Pods) != 2 {
+		t.Errorf("want 2 pods, got %d", len(resp.Pods))
+	}
+	if len(resp.History) == 0 {
+		t.Error("want history populated for the matched workload's own key")
 	}
 }
 
