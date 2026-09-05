@@ -54,7 +54,12 @@ type Config struct {
 	CollectorTLS       TLS
 
 	Interval time.Duration
-	Timeout  time.Duration
+	// Timeout bounds a single connectivity health check.
+	Timeout time.Duration
+	// QueryTimeout bounds a single Prometheus range or instant query. These are
+	// orders of magnitude more expensive than a health check — a multi-week
+	// range query is normal work — so they must not inherit Timeout.
+	QueryTimeout time.Duration
 }
 
 type ProviderStatus struct {
@@ -85,8 +90,13 @@ type Snapshot struct {
 type inspector func(body []byte) (detail string, degraded bool)
 
 type provider struct {
-	name       string
-	signal     string
+	name string
+	// signal is the human-facing label for what this backend supplies.
+	signal string
+	// baseURL is the configured root. endpoint is the specific URL the health
+	// check calls; query paths are derived from baseURL instead, so a provider
+	// used for both never has to be rewritten in place.
+	baseURL    string
 	endpoint   string
 	authHeader string
 	client     *http.Client
@@ -99,9 +109,10 @@ type provider struct {
 }
 
 type Monitor struct {
-	providers []provider
-	interval  time.Duration
-	log       *slog.Logger
+	providers       []provider
+	prometheusQuery provider
+	interval        time.Duration
+	log             *slog.Logger
 
 	mu   sync.RWMutex
 	snap Snapshot
@@ -118,55 +129,99 @@ func New(cfg Config, log *slog.Logger) *Monitor {
 		log = slog.Default()
 	}
 
-	providers := []provider{
-		{
-			name:       "prometheus",
+	if cfg.QueryTimeout <= 0 {
+		cfg.QueryTimeout = 30 * time.Second
+	}
+
+	// Each entry pairs a provider with its own TLS settings, so the two can
+	// never drift apart the way parallel slices indexed by position can.
+	specs := []struct {
+		provider provider
+		tls      TLS
+	}{
+		{provider{
+			name:       prometheusProvider,
 			signal:     "metrics",
+			baseURL:    strings.TrimSpace(cfg.PrometheusURL),
 			endpoint:   endpoint(cfg.PrometheusURL, "/-/ready"),
 			authHeader: bearer(cfg.PrometheusBearerToken),
-		},
-		{
+		}, cfg.PrometheusTLS},
+		{provider{
 			name:       "elasticsearch",
 			signal:     "logs and traces",
+			baseURL:    strings.TrimSpace(cfg.ElasticsearchURL),
 			endpoint:   endpoint(cfg.ElasticsearchURL, "/_cluster/health?local=true"),
 			authHeader: apiKey(cfg.ElasticsearchAPIKey),
 			inspect:    elasticsearchHealth,
-		},
-		{
+		}, cfg.ElasticsearchTLS},
+		{provider{
 			name:     "otel-collector",
 			signal:   "OTLP ingress",
 			endpoint: strings.TrimSpace(cfg.CollectorHealthURL),
-		},
+		}, cfg.CollectorTLS},
 	}
-	tlsCfg := []TLS{cfg.PrometheusTLS, cfg.ElasticsearchTLS, cfg.CollectorTLS}
 
-	initial := Snapshot{Providers: make([]ProviderStatus, 0, len(providers))}
-	for i := range providers {
-		p := &providers[i]
-		p.skipVerify = tlsCfg[i].Insecure
-		client, err := newClient(tlsCfg[i], cfg.Timeout)
+	providers := make([]provider, 0, len(specs))
+	initial := Snapshot{Providers: make([]ProviderStatus, 0, len(specs))}
+	for _, spec := range specs {
+		p := spec.provider
+		p.skipVerify = spec.tls.Insecure
+		client, err := newClient(spec.tls, cfg.Timeout)
 		if err != nil {
 			p.setupErr = "TLS trust store could not be loaded"
 			log.Error("integration TLS configuration is unusable",
-				"provider", p.name, "ca_file", tlsCfg[i].CAFile, "err", err)
+				"provider", p.name, "ca_file", spec.tls.CAFile, "err", err)
 		}
 		p.client = client
 		if p.skipVerify && p.endpoint != "" {
 			log.Warn("integration TLS verification is DISABLED — traffic to this backend is not authenticated",
 				"provider", p.name)
 		}
+		providers = append(providers, p)
 		initial.Providers = append(initial.Providers, ProviderStatus{
 			Name: p.name, Signal: p.signal, Configured: p.endpoint != "",
 			TLSSkipVerify: p.skipVerify,
 		})
 	}
 
-	return &Monitor{
-		providers: providers,
-		interval:  cfg.Interval,
-		log:       log,
-		snap:      initial,
+	// The query path is resolved by name, never by position: a copy taken from
+	// the wrong index would send Prometheus's queries — and whichever
+	// credential that provider carries — to a different backend entirely.
+	prometheusQuery, ok := findProvider(providers, prometheusProvider)
+	if !ok {
+		// Unreachable while the spec list above declares a prometheus entry.
+		// Panicking here is deliberate: silently degrading to "queries never
+		// work" would be discovered in production, not in a test.
+		panic("integrations: no provider named " + prometheusProvider)
 	}
+	// Range and instant queries are minutes of Prometheus work, not the
+	// sub-second liveness probe the health client is sized for, so they get a
+	// client with their own timeout and their own connection pool.
+	queryClient, err := newClient(cfg.PrometheusTLS, cfg.QueryTimeout)
+	if err != nil {
+		prometheusQuery.setupErr = "TLS trust store could not be loaded"
+	}
+	prometheusQuery.client = queryClient
+	prometheusQuery.endpoint = ""
+
+	return &Monitor{
+		providers:       providers,
+		prometheusQuery: prometheusQuery,
+		interval:        cfg.Interval,
+		log:             log,
+		snap:            initial,
+	}
+}
+
+const prometheusProvider = "prometheus"
+
+func findProvider(providers []provider, name string) (provider, bool) {
+	for _, p := range providers {
+		if p.name == name {
+			return p, true
+		}
+	}
+	return provider{}, false
 }
 
 // newClient builds a provider-scoped client. Each provider gets its own so one

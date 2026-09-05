@@ -2,11 +2,12 @@
 
 ## Product decision
 
-Beholdr is currently a lightweight Kubernetes resource observer. It is **not**
-yet a replacement for New Relic, Grafana, or Prometheus: it only reads the
-Kubernetes API and `metrics.k8s.io`, retains about one hour of in-memory CPU,
-memory, pod, and replica samples, and has no alerting, logs, traces, durable
-storage, authentication, or arbitrary metric query capability.
+Beholdr is currently a lightweight Kubernetes resource observer with external
+telemetry-provider integration. It is **not** yet a replacement for New Relic,
+Grafana, or Prometheus: Kubernetes state still has about one hour of in-memory
+history, while Prometheus supplies bounded per-service long-range charts.
+Beholdr has no notification delivery, log/trace search, durable storage of its
+own, built-in authentication, or arbitrary metric query capability.
 
 The recommended release path is therefore two tracks:
 
@@ -17,23 +18,23 @@ The recommended release path is therefore two tracks:
 Priorities: **P0** blocks a production release; **P1** belongs in the first
 production-ready release; **P2** is planned follow-up.
 
-## P0 — release blockers
+## Delivered foundations
 
-- [ ] **Correct health semantics.** Split liveness from readiness. Liveness
-  should only establish that the process can serve requests; readiness must
-  fail until there has been a successful collection and when its data is stale.
-  Return the last-success time and latest collection error. Point the two
-  Kubernetes probes at the appropriate endpoints.  
-  _Why:_ `/api/health` currently returns HTTP 200 even when `ready` is false,
-  so the deployment can receive traffic before it has usable data.
+- [x] Correct liveness/readiness semantics and stale-data reporting.
+- [x] Secure deployment boundary: CORS disabled by default, explicit TLS mode,
+  and required ingress authentication unless deliberately overridden.
+- [x] Deterministic Go/frontend dependency locks, PR tests, frontend build, and
+  container-build quality gates.
+- [x] Read-only Prometheus, Elasticsearch, and OpenTelemetry Collector health
+  integrations with provider-scoped TLS and secret-backed credentials.
+- [x] Fixed, bounded per-service PromQL queries and charts for HTTP error
+  rate/week comparison, CPU, memory, and failing pods — configurable metric and
+  label profile, thresholds validated at startup, severity scored from an
+  instant query so it does not vary with the selected chart window, and reports
+  cached, de-duplicated and concurrency-bounded so the UI cannot amplify load
+  onto Prometheus.
 
-- [ ] **Secure the UI and API by default.** Set CORS off by default, support an
-  explicit allowlist of origins, and document a required authentication model
-  (for example an OIDC-aware ingress/proxy). Require TLS in the production
-  ingress example and reject/flag insecure production configuration.  
-  _Why:_ the default is permissive CORS and the supplied ingress has neither
-  TLS nor authentication, exposing cluster topology, pod names, and resource
-  usage.
+## P0 — remaining release blockers
 
 - [ ] **Make collector health and metric availability correct under failure.**
   Synchronize client state or return availability/errors as part of each
@@ -43,19 +44,13 @@ production-ready release; **P2** is planned follow-up.
   becomes permanently false after one error, and current zero values are
   indistinguishable from missing metrics.
 
-- [ ] **Create a repeatable, clean build.** Commit `go.sum` and the web lock
-  file; use `npm ci` in the container; pin base images and GitHub Actions by
-  digest/immutable revision; generate an SBOM and scan image/dependencies in
-  CI.  
-  _Why:_ the repository has no Go checksum file and ignores the frontend lock
-  file, while the Docker build resolves dependencies dynamically.
+- [ ] **Finish supply-chain hardening.** Dependency locks and deterministic
+  builds are in place. Pin base images and GitHub Actions by digest/immutable
+  revision, generate an SBOM, and scan image/dependencies in CI.
 
-- [ ] **Establish automated quality gates.** Add unit tests for configuration,
-  collector aggregation/failure paths, API status/headers, and history bounds;
-  add frontend type/check/build tests; run all checks, container build, IaC
-  validation, vulnerability scan, and license checks on pull requests. Publish
-  coverage and fail on regressions.  
-  _Why:_ there are no tests and CI only publishes an image on tags/manual runs.
+- [ ] **Finish automated quality gates.** Backend/frontend tests and builds plus
+  the container build run on pull requests. Add IaC validation, vulnerability
+  and license checks, publish coverage, and fail on coverage regressions.
 
 - [ ] **Fix documented-versus-actual workload coverage.** Either implement
   StatefulSet and DaemonSet discovery with their real desired/ready status, or
@@ -136,7 +131,10 @@ production-ready release; **P2** is planned follow-up.
   network, and custom metrics; support labels, dimensional aggregation,
   recording rules, remote write/read or an equivalent durable protocol,
   cardinality controls, and a query language/API. The Kubernetes metrics API
-  alone cannot supply this.
+  alone cannot supply this. Fixed service range queries are now present; still
+  add managed Prometheus identity/token refresh, recording rules,
+  query caching/concurrency limits, and configurable metric-schema profiles for
+  ASP.NET Core runtime metrics and future OpenTelemetry metrics.
 
 - [ ] **Build a dashboard and exploration layer.** Add composable dashboards,
   panels, variables, annotations, ad-hoc queries, sharing/export, provisioning
@@ -170,8 +168,9 @@ production-ready release; **P2** is planned follow-up.
   workloads, and cost allocation by team/namespace/label.
 - [ ] **Change intelligence:** correlate deploys, configuration changes,
   autoscaling, events, and incidents; add rollback-risk and anomaly views.
-- [ ] **Service health views:** golden signals, dependency/service maps, SLO
-  scorecards, error-budget forecasting, and release-health comparison.
+- [ ] **Complete service health views:** the first error/CPU/memory/pod signals
+  now exist; add dependency/service maps, latency, traffic, SLO scorecards,
+  error-budget forecasting, and release-health comparison.
 - [ ] **Integrations:** Alertmanager-compatible webhooks, Slack/PagerDuty/email,
   GitHub/GitOps annotations, cloud-provider metrics, databases, and managed
   Kubernetes distributions.

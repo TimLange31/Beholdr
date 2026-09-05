@@ -33,6 +33,9 @@ renders it.
   Elasticsearch logs/traces source, and OpenTelemetry ingestion gateway,
   including whether each one calls itself healthy and whether its certificate
   is actually being verified.
+- **Service health** — bounded Prometheus-backed charts from one hour through
+  21 days for HTTP 5xx rate (with the week-before series), CPU/request usage,
+  memory/limit usage, and failing pods.
 
 > Prerequisite: **metrics-server** must be installed for live CPU/memory. Without
 > it, topology and replica data still work but usage reads 0 (the UI shows a banner).
@@ -63,6 +66,8 @@ GET /api/nodes                            all nodes
 GET /api/nodes/{name}                     node detail + pods + history
 GET /api/microservices                    all workloads
 GET /api/microservices/{ns}/{name}        workload detail + pods + history
+GET /api/microservices/{ns}/{name}/metrics?range=24h
+                                          fixed service signals; range: 1h|6h|24h|7d|21d
 GET /api/pods                             all pods
 ```
 
@@ -94,7 +99,8 @@ might be stale.
 | `BEHOLDR_OTEL_COLLECTOR_CA_FILE` | *(system roots)* | PEM bundle that signs the Collector's certificate |
 | `BEHOLDR_OTEL_COLLECTOR_TLS_INSECURE` | `false` | Skip certificate verification. Last resort — logged at WARN, shown as unverified in the UI |
 | `BEHOLDR_INTEGRATION_CHECK_INTERVAL` | `30` | Seconds between integration health checks |
-| `BEHOLDR_INTEGRATION_REQUEST_TIMEOUT` | `5` | Per-request integration timeout in seconds |
+| `BEHOLDR_INTEGRATION_REQUEST_TIMEOUT` | `5` | Per-request timeout for the connectivity health checks, in seconds |
+| `BEHOLDR_PROMETHEUS_QUERY_TIMEOUT` | `30` | Per-query timeout for Prometheus range/instant queries, in seconds. See [Service health queries](#service-health-queries) for the rest of that configuration |
 
 ## Security model
 
@@ -128,6 +134,99 @@ vocabulary (`connection refused`, `DNS lookup failed`, `TLS certificate signed
 by an unknown authority — set the CA bundle`, …) that interpolates nothing from
 the endpoint, the credential, or the upstream response. The full error goes to
 the pod log.
+
+## Service health queries
+
+Beholdr owns the PromQL templates and only exposes the five bounded windows
+`1h`, `6h`, `24h`, `7d`, and `21d`. The browser cannot submit arbitrary PromQL.
+Each query is limited to 2,000 evaluation points and a 2 MiB response, several
+run per report, and reports are cached and de-duplicated (see
+`BEHOLDR_SERVICE_METRICS_CACHE_TTL` and `BEHOLDR_SERVICE_MAX_CONCURRENT_QUERIES`)
+so a page left open cannot turn into load on the Prometheus you are debugging
+with.
+
+Each signal is evaluated twice: a **range query** over the selected window draws
+the chart, and an **instant query** at *now* produces the number and the
+severity. They are deliberately separate — a range query's newest point is only
+as fresh as that range's step, so scoring from it would make a service's
+severity depend on which window happened to be selected, and a spike that
+started ten minutes ago would be invisible on the 21-day view.
+
+| Signal | Calculation | Warning | Critical |
+|--------|-------------|---------|----------|
+| HTTP error rate | HTTP 5xx request rate / all HTTP request rate | 1% | 5% |
+| Error-rate increase | Current rate minus the aligned `offset 1w` series (windows ≤ 7d only) | +0.5 percentage points | +2 percentage points |
+| CPU | Container CPU usage / Kubernetes CPU **limits** (see `BEHOLDR_SERVICE_CPU_BASIS`) | 80% | 95% |
+| Memory | Container working set / Kubernetes memory limits | 80% | 95% |
+| Failing pods | Crash/image/config waiting pods plus Failed/Unknown pods, excluding Job pods | ≥10% (minimum 1) | ≥25% (minimum 2; 1 and no warning band for a single-replica service) |
+
+These thresholds produce health states in the API and UI; they do not send
+notifications. Each signal reports a `state` alongside its severity:
+
+- `ok` — measured.
+- `no_data` — the metric does not exist for this workload (no memory limit
+  configured, no HTTP traffic). Skipped in the service's aggregate state: a
+  service without a memory limit is not thereby in an unknown condition.
+- `error` — the query itself failed. Counts as `unknown` in the aggregate, so a
+  broken query can never make a service look green.
+
+**CPU is scored against limits, not requests.** Requests are a scheduling
+floor rather than a ceiling, and a healthy bursty service routinely runs at
+several hundred percent of its request, so thresholds of 80/95 against requests
+would mark it critical forever. Set `BEHOLDR_SERVICE_CPU_BASIS=requests` if you
+prefer that view, and raise the CPU thresholds to match.
+
+**The week-before overlay is only drawn on windows up to 7d.** Past a week the
+`offset 1w` series overlaps the current one — the same wall-clock samples drawn
+twice — so it is suppressed rather than presented as a comparison. Where it is
+drawn, a complete overlay needs the window plus seven days of Prometheus
+retention.
+
+**Which pods a signal covers.** Scoring pins itself to the pod names the
+collector currently sees for the workload, so a badge can never be raised by
+another service's pods. The charts select by pod-name shape instead, so pods
+replaced by earlier rollouts stay in the history; that shape cannot always
+separate a workload named `api` from one named `api-gateway`, which is why the
+score does not rely on it.
+
+### Metric profile
+
+Beholdr's defaults describe an ASP.NET Core application scraped with
+`kubernetes_namespace` / `app_kubernetes_io_name` labels, plus
+cAdvisor/kube-state-metrics for the Kubernetes signals. Every one of them is
+configurable, and a value that is set but unusable (a malformed metric name, a
+critical threshold at or below its warning) stops the process at startup rather
+than being silently replaced with something you did not choose.
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `BEHOLDR_PROMETHEUS_QUERY_TIMEOUT` | `30` | Seconds per range/instant query. Separate from `BEHOLDR_INTEGRATION_REQUEST_TIMEOUT`, which sizes the liveness check — a multi-week range query is normal work and must not inherit it |
+| `BEHOLDR_SERVICE_METRICS_CACHE_TTL` | `30` | Seconds a completed report is reused. Concurrent requests for the same workload and window always share one evaluation |
+| `BEHOLDR_SERVICE_MAX_CONCURRENT_QUERIES` | `6` | Upper bound on Prometheus queries in flight from this pod |
+| `BEHOLDR_SERVICE_HTTP_REQUESTS_METRIC` | `aspnetcore_requests_duration_seconds_count` | Counter of handled HTTP requests. For OpenTelemetry conventions: `http_server_request_duration_seconds_count` |
+| `BEHOLDR_SERVICE_HTTP_ERRORS_METRIC` | *(empty)* | Optional separate failure counter. Empty means errors come from the requests metric filtered by the status label |
+| `BEHOLDR_SERVICE_HTTP_STATUS_LABEL` | `code` | Response-status label. For OpenTelemetry conventions: `http_response_status_code` |
+| `BEHOLDR_SERVICE_APP_NAMESPACE_LABEL` | `kubernetes_namespace` | Namespace label on your application metrics |
+| `BEHOLDR_SERVICE_APP_SERVICE_LABEL` | `app_kubernetes_io_name` | Service label on your application metrics, matched against the workload name — it must carry the same value as the Deployment name, or the HTTP signals find nothing |
+| `BEHOLDR_SERVICE_APP_POD_LABEL` | `kubernetes_pod_name` | Pod label on your application metrics, used when no service label is available |
+| `BEHOLDR_SERVICE_KUBE_NAMESPACE_LABEL` | `namespace` | Namespace label on cAdvisor/kube-state-metrics series |
+| `BEHOLDR_SERVICE_KUBE_POD_LABEL` | `pod` | Pod label on cAdvisor/kube-state-metrics series |
+| `BEHOLDR_SERVICE_CPU_BASIS` | `limits` | `limits` or `requests` — what CPU usage is scored against |
+| `BEHOLDR_SERVICE_ERROR_RATE_WARNING` / `_CRITICAL` | `1` / `5` | Error-rate thresholds, in percent |
+| `BEHOLDR_SERVICE_ERROR_INCREASE_WARNING` / `_CRITICAL` | `0.5` / `2` | Week-over-week increase thresholds, in percentage points |
+| `BEHOLDR_SERVICE_CPU_WARNING` / `_CRITICAL` | `80` / `95` | CPU thresholds, in percent of the chosen basis |
+| `BEHOLDR_SERVICE_MEMORY_WARNING` / `_CRITICAL` | `80` / `95` | Memory thresholds, in percent of limits |
+| `BEHOLDR_SERVICE_FAILING_PODS_WARNING` / `_CRITICAL` | `1` / `2` | Failing-pod counts, raised to 10%/25% of desired replicas for larger workloads |
+
+The Terraform module exposes the same settings as `service_*` variables and a
+`service_thresholds` object. It refuses to apply if any of them are set without
+`prometheus_url`, since nothing would query them.
+
+The Kubernetes signals require **kube-state-metrics** and cAdvisor
+(`kube_pod_container_resource_limits`, `kube_pod_status_phase`,
+`kube_pod_container_status_waiting_reason`, `kube_pod_owner`, `kube_pod_info`,
+`container_cpu_usage_seconds_total`, `container_memory_working_set_bytes`) in
+the same Prometheus.
 
 ### TLS termination
 
@@ -235,8 +334,9 @@ Prefer raw manifests? See `deploy/k8s/beholdr.yaml`.
 
 ## Notes & limits
 
-History is in-memory, so it resets on pod restart and isn't shared across
-replicas — run a single replica (the default). If you later want durable,
-long-range history or alerting, configure external telemetry systems. The
-current integration slice checks backend connectivity only; querying and
-correlating their telemetry will be added behind the same provider boundary.
+Kubernetes collector history is still in-memory, so it resets on pod restart
+and isn't shared across replicas — run a single replica (the default).
+Prometheus-backed service-health charts are read directly from the external
+store and therefore support the configured backend's durable history. Log and
+trace querying and cross-signal correlation are still to be added behind the
+same provider boundary.

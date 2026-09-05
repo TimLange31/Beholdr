@@ -14,9 +14,9 @@
   const padL = 40, padR = 12, padT = 12, padB = 22;
 
   const maxY = $derived.by(() => {
-    if (unit === "%") return 100;
     let m = 0;
     for (const p of data) for (const l of lines) m = Math.max(m, p[l.key] ?? 0);
+    if (unit === "%") return Math.max(100, m * 1.15);
     return m <= 0 ? 1 : m * 1.15;
   });
 

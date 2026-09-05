@@ -9,28 +9,35 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/delangetimm/beholdr/internal/collect"
 	"github.com/delangetimm/beholdr/internal/integrations"
 	"github.com/delangetimm/beholdr/internal/k8s"
+	"github.com/delangetimm/beholdr/internal/servicehealth"
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 // fakeSource is an empty-but-successful (or erroring) Source: enough to
 // drive the collector through a poll without a real cluster.
-type fakeSource struct{ err error }
+type fakeSource struct {
+	err         error
+	deployments []appsv1.Deployment
+	pods        []corev1.Pod
+}
 
 func (f *fakeSource) Nodes(context.Context) ([]corev1.Node, error) { return nil, f.err }
-func (f *fakeSource) Pods(context.Context) ([]corev1.Pod, error)   { return nil, f.err }
+func (f *fakeSource) Pods(context.Context) ([]corev1.Pod, error)   { return f.pods, f.err }
 func (f *fakeSource) Deployments(context.Context) ([]appsv1.Deployment, error) {
-	return nil, f.err
+	return f.deployments, f.err
 }
 func (f *fakeSource) HPAs(context.Context) ([]autoscalingv1.HorizontalPodAutoscaler, error) {
 	return nil, nil
@@ -51,7 +58,7 @@ func newTestServer(t *testing.T, corsOrigins []string, collected bool, srcErr er
 		cancel()
 		col.Run(ctx)
 	}
-	return NewServer(col, nil, corsOrigins, testLogger())
+	return NewServer(col, nil, nil, corsOrigins, testLogger())
 }
 
 // newTestServerWithMonitor wires a real integration Monitor, already checked
@@ -62,7 +69,7 @@ func newTestServerWithMonitor(t *testing.T, cfg integrations.Config) *Server {
 	col := collect.New(&fakeSource{}, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
 	mon := integrations.New(cfg, testLogger())
 	mon.Check(context.Background())
-	return NewServer(col, mon, nil, testLogger())
+	return NewServer(col, mon, nil, nil, testLogger())
 }
 
 func do(s *Server, method, path, origin string) *httptest.ResponseRecorder {
@@ -244,7 +251,7 @@ func TestIntegrationsEndpointServesTheMonitorSnapshot(t *testing.T) {
 func TestIntegrationsResponseNeverCarriesEndpointsOrCredentials(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"status":"green","cluster_name":"nlziet-prod"}`)
+		_, _ = io.WriteString(w, `{"status":"green","cluster_name":"production-cluster"}`)
 	}))
 	defer backend.Close()
 
@@ -261,7 +268,7 @@ func TestIntegrationsResponseNeverCarriesEndpointsOrCredentials(t *testing.T) {
 		"prom-token-should-never-appear",
 		"elastic-key-should-never-appear",
 		backend.URL,
-		"nlziet-prod",
+		"production-cluster",
 	} {
 		if strings.Contains(body, secret) {
 			t.Fatalf("response leaked %q: %s", secret, body)
@@ -269,5 +276,159 @@ func TestIntegrationsResponseNeverCarriesEndpointsOrCredentials(t *testing.T) {
 	}
 	if !strings.Contains(body, "cluster status green") {
 		t.Fatalf("expected the sanitized health detail to survive: %s", body)
+	}
+}
+
+type apiMetricsQuerier struct {
+	mu       sync.Mutex
+	instants []string
+	err      error
+}
+
+func (q *apiMetricsQuerier) QueryPrometheusRange(_ context.Context, _ string, start, _ time.Time, _ time.Duration) ([]integrations.TimeSeries, error) {
+	if q.err != nil {
+		return nil, q.err
+	}
+	return []integrations.TimeSeries{{Values: []integrations.Sample{{Timestamp: float64(start.Unix()), Value: 0.5}}}}, nil
+}
+
+func (q *apiMetricsQuerier) QueryPrometheusInstant(_ context.Context, query string, _ time.Time) ([]integrations.InstantSample, error) {
+	q.mu.Lock()
+	q.instants = append(q.instants, query)
+	q.mu.Unlock()
+	if q.err != nil {
+		return nil, q.err
+	}
+	return []integrations.InstantSample{{Sample: integrations.Sample{Value: 0.5}}}, nil
+}
+
+func newServiceMetricsServer(t *testing.T, querier *apiMetricsQuerier) *Server {
+	t.Helper()
+	replicas := int32(2)
+	src := &fakeSource{
+		deployments: []appsv1.Deployment{{
+			ObjectMeta: metav1.ObjectMeta{Name: "video", Namespace: "production"},
+			Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
+		}},
+		pods: []corev1.Pod{
+			pod("production", "video-7d9f8c6b54-x2k9p", "video"),
+			pod("production", "video-7d9f8c6b54-b1n4q", "video"),
+			pod("production", "video-gateway-7d9f8c6b54-zzzzz", "video-gateway"),
+		},
+	}
+	col := collect.New(src, time.Hour, 5*time.Second, 10, func() bool { return true }, testLogger())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	col.Run(ctx)
+	health, err := servicehealth.New(querier, servicehealth.Config{CacheTTL: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewServer(col, nil, health, nil, testLogger())
+}
+
+func pod(namespace, name, workload string) corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name, Namespace: namespace,
+			Labels: map[string]string{"app": workload},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+}
+
+func TestMicroserviceMetricsEndpoint(t *testing.T) {
+	s := newServiceMetricsServer(t, &apiMetricsQuerier{})
+	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=21d", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("severity must not be cached by the browser, got %q", got)
+	}
+	var report servicehealth.Report
+	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Namespace != "production" || report.Service != "video" || report.Window != "21d" || len(report.Signals) != 4 {
+		t.Fatalf("unexpected report: %+v", report)
+	}
+	if report.Compared {
+		t.Error("the 21d window must not claim a week-before comparison")
+	}
+}
+
+// The scoring queries must be pinned to the pods this workload owns, never to
+// a name-shaped guess that can pick up a sibling service.
+func TestMicroserviceMetricsScoresOnlyItsOwnPods(t *testing.T) {
+	querier := &apiMetricsQuerier{}
+	s := newServiceMetricsServer(t, querier)
+	if w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=1h", ""); w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	querier.mu.Lock()
+	defer querier.mu.Unlock()
+	if len(querier.instants) == 0 {
+		t.Fatal("no instant queries were issued")
+	}
+	for _, query := range querier.instants {
+		if !strings.Contains(query, "kube_pod_info") {
+			continue
+		}
+		if !strings.Contains(query, "video-7d9f8c6b54-x2k9p") || !strings.Contains(query, "video-7d9f8c6b54-b1n4q") {
+			t.Errorf("scoring query is not pinned to the workload's pods: %s", query)
+		}
+		if strings.Contains(query, "video-gateway") {
+			t.Errorf("scoring query picked up a sibling workload's pod: %s", query)
+		}
+	}
+}
+
+func TestMicroserviceMetricsRejectsUnsupportedRange(t *testing.T) {
+	s := newServiceMetricsServer(t, &apiMetricsQuerier{})
+	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=90d", "")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d", w.Code)
+	}
+}
+
+func TestMicroserviceMetricsUnknownWorkloadIs404(t *testing.T) {
+	s := newServiceMetricsServer(t, &apiMetricsQuerier{})
+	w := do(s, http.MethodGet, "/api/microservices/production/nope/metrics?range=1h", "")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", w.Code)
+	}
+}
+
+func TestMicroserviceMetricsWithoutPrometheusIs503(t *testing.T) {
+	querier := &apiMetricsQuerier{err: integrations.ErrPrometheusNotConfigured}
+	s := newServiceMetricsServer(t, querier)
+	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=1h", "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("want 503, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A backend failure is reported through the signal states, not as a dead
+// endpoint: the operator still gets the charts and an actionable message.
+func TestMicroserviceMetricsSurfacesQueryFailuresPerSignal(t *testing.T) {
+	querier := &apiMetricsQuerier{err: integrations.ErrPrometheusQueryRejected}
+	s := newServiceMetricsServer(t, querier)
+	w := do(s, http.MethodGet, "/api/microservices/production/video/metrics?range=1h", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var report servicehealth.Report
+	if err := json.Unmarshal(w.Body.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Severity != servicehealth.SeverityUnknown {
+		t.Fatalf("failed queries must not read as healthy: %s", report.Severity)
+	}
+	body := w.Body.String()
+	for _, secret := range []string{"kube_pod_info", "aspnetcore_", "namespace="} {
+		if strings.Contains(body, secret) {
+			t.Errorf("response leaked query internals (%q): %s", secret, body)
+		}
 	}
 }

@@ -2,30 +2,38 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/delangetimm/beholdr/internal/collect"
 	"github.com/delangetimm/beholdr/internal/integrations"
+	"github.com/delangetimm/beholdr/internal/servicehealth"
 	"github.com/delangetimm/beholdr/internal/webui"
 )
 
 type Server struct {
-	col          *collect.Collector
-	integrations *integrations.Monitor
-	log          *slog.Logger
-	corsOrigins  []string
+	col           *collect.Collector
+	integrations  *integrations.Monitor
+	serviceHealth *servicehealth.Service
+	log           *slog.Logger
+	corsOrigins   []string
 }
 
 // NewServer builds the API server. corsOrigins is an explicit allowlist of
 // origins permitted to make cross-origin requests; nil/empty disables CORS
 // entirely (the default). "*" may be included to allow any origin, which is
 // only appropriate for local development.
-func NewServer(col *collect.Collector, integrations *integrations.Monitor, corsOrigins []string, log *slog.Logger) *Server {
-	return &Server{col: col, integrations: integrations, log: log, corsOrigins: corsOrigins}
+// serviceHealth may be nil, in which case the per-service metrics endpoint
+// reports that Prometheus is not configured. It is built by the caller so an
+// unusable metric profile fails at startup rather than per request.
+func NewServer(col *collect.Collector, integrations *integrations.Monitor, serviceHealth *servicehealth.Service, corsOrigins []string, log *slog.Logger) *Server {
+	return &Server{col: col, integrations: integrations, serviceHealth: serviceHealth, log: log, corsOrigins: corsOrigins}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -47,6 +55,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/nodes", s.nodes)
 	mux.HandleFunc("GET /api/nodes/{name}", s.nodeDetail)
 	mux.HandleFunc("GET /api/microservices", s.microservices)
+	mux.HandleFunc("GET /api/microservices/{ns}/{name}/metrics", s.microserviceMetrics)
 	mux.HandleFunc("GET /api/microservices/{ns}/{name}", s.microserviceDetail)
 	mux.HandleFunc("GET /api/pods", s.pods)
 	mux.Handle("/", s.spa())
@@ -197,6 +206,66 @@ func (s *Server) microserviceDetail(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"microservice": ms, "pods": pods, "history": s.col.History.Get("ms::" + key),
 	})
+}
+
+func (s *Server) microserviceMetrics(w http.ResponseWriter, r *http.Request) {
+	snap, ok := s.requireData(w)
+	if !ok {
+		return
+	}
+	ns, name := r.PathValue("ns"), r.PathValue("name")
+	var workload *collect.Microservice
+	for i := range snap.Microservices {
+		if snap.Microservices[i].Namespace == ns && snap.Microservices[i].Name == name {
+			workload = &snap.Microservices[i]
+			break
+		}
+	}
+	// Resolving against the snapshot before querying is what keeps the path
+	// parameters out of the PromQL templates: only the names of Kubernetes
+	// objects the collector actually saw can reach them.
+	if workload == nil {
+		http.Error(w, "microservice not found", http.StatusNotFound)
+		return
+	}
+	window, ok := servicehealth.ParseWindow(r.URL.Query().Get("range"))
+	if !ok {
+		http.Error(w, "range must be one of: 1h, 6h, 24h, 7d, 21d", http.StatusBadRequest)
+		return
+	}
+	if s.serviceHealth == nil {
+		http.Error(w, "Prometheus is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	// The live pod names let the score pin itself to pods this workload
+	// actually owns; the charts still use the name-shape selector so pods
+	// replaced by earlier rollouts stay in the history.
+	podNames := make([]string, 0, 8)
+	for _, p := range snap.Pods {
+		if p.Namespace == ns && p.Workload == name {
+			podNames = append(podNames, p.Name)
+		}
+	}
+
+	report, err := s.serviceHealth.Query(r.Context(), *workload, podNames, window, time.Now())
+	switch {
+	case err == nil:
+	case errors.Is(err, integrations.ErrPrometheusNotConfigured):
+		http.Error(w, "Prometheus is not configured", http.StatusServiceUnavailable)
+		return
+	case errors.Is(err, context.Canceled):
+		// The client went away mid-flight; there is nobody to answer.
+		return
+	default:
+		s.log.Warn("service health query failed", "namespace", ns, "service", name, "err", err)
+		http.Error(w, "service metrics unavailable", http.StatusBadGateway)
+		return
+	}
+	// Reports are cached server-side for a short window; letting a browser or
+	// proxy hold one for longer would show an operator a stale severity badge.
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, report)
 }
 
 func (s *Server) pods(w http.ResponseWriter, r *http.Request) {
