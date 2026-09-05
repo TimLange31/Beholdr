@@ -39,7 +39,7 @@ It runs as a single small container with the dashboard included.
 
 ## Try it locally
 
-You need **Go 1.22 or newer**, **Node.js 20 with npm**, and a working kubeconfig
+You need **Go 1.25 or newer**, **Node.js 22 with npm**, and a working kubeconfig
 with permission to read nodes, pods, Deployments, HPAs, and metrics. Beholdr uses
 your current Kubernetes context. Install **metrics-server** in the cluster for
 live CPU and memory usage; topology and replica information work without it.

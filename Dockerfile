@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ---- stage 1: build the SvelteKit UI ----
-FROM node:20-alpine AS ui
+FROM node:22-alpine AS ui
 WORKDIR /ui
 COPY web/package.json web/package-lock.json ./
 # npm ci requires the lock file and never modifies it, so the exact dependency
@@ -11,7 +11,10 @@ COPY web/ ./
 RUN npm run build          # -> /ui/build (static SPA)
 
 # ---- stage 2: build the Go binary with the UI embedded ----
-FROM golang:1.22-alpine AS build
+# Pinned to a current patch release, not a floating minor tag: the Go
+# standard library ships inside the compiled binary, so the build toolchain
+# itself is part of the release's vulnerability surface (see #33).
+FROM golang:1.25.14-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 # go.sum is committed, so this only downloads/verifies against it — it never
